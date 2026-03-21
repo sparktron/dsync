@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dsync"
+version = "0.1.0"
+description = "SSH deploy tool for dylansparks.com"
+requires-python = ">=3.9"
+dependencies = [
+    "click>=8.1",
+    "paramiko>=3.4",
+    "rich>=13.7",
+    "watchdog>=4.0",
+]
+
+[project.scripts]
+dsync = "dsync.cli:cli"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["dsync*"]
