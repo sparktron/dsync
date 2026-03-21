@@ -1,21 +1,43 @@
-# dsync
+# 🔄 dsync
 
-SSH deploy tool for [dylansparks.com](https://dylansparks.com).
+> SSH deploy tool for personal sites on cPanel shared hosting.
+
+[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue?logo=python&logoColor=white)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![rsync](https://img.shields.io/badge/powered%20by-rsync-orange)](https://rsync.samba.org/)
 
 Edit files locally, sync them to cPanel shared hosting over SSH/rsync.
 No build step. No framework. Just files.
 
 ---
 
-## Requirements
+## 📋 Table of Contents
 
-- Python 3.9+
-- `rsync` installed locally
+- [Requirements](#-requirements)
+- [Install](#-install)
+- [First-run setup](#-first-run-setup)
+- [Commands](#-commands)
+  - [`dsync pull`](#dsync-pull)
+  - [`dsync push`](#dsync-push-path)
+  - [`dsync watch`](#dsync-watch)
+  - [`dsync status`](#dsync-status)
+  - [`dsync backup`](#dsync-backup)
+  - [`dsync open`](#dsync-open-path)
+- [Config reference](#-config-reference)
+- [How SSH auth works](#-how-ssh-auth-works)
+- [State file](#-state-file)
+
+---
+
+## ✅ Requirements
+
+- [Python 3.9+](https://www.python.org/downloads/)
+- [`rsync`](https://rsync.samba.org/) installed locally
 - `ssh-agent` or `ssh-add` available (used to load your passphrase-protected key for rsync)
 
 ---
 
-## Install
+## 📦 Install
 
 ```bash
 pip install -e /path/to/dsync
@@ -31,7 +53,7 @@ After install, `dsync` is available as a CLI command.
 
 ---
 
-## First-run setup
+## 🧙 First-run setup
 
 Running any `dsync` command when no config exists launches an interactive wizard:
 
@@ -44,13 +66,13 @@ dsync — first-run setup
 
 No config found at ~/.dsync/config.json. Let's set one up.
 
-SSH host [dubstep.cleannameservers.com]:
-SSH port [50288]:
-SSH user [dylanspa]:
-Path to SSH private key [~/Documents/dylansparks.com/id_rsa]:
-Local project root [~/Documents/dylansparks.com/public_html/]:
-Remote web root [/home/dylanspa/public_html/]:
-Live site URL [https://dylansparks.com]:
+SSH host [your-host.example.com]:
+SSH port [22]:
+SSH user [youruser]:
+Path to SSH private key [~/.ssh/id_rsa]:
+Local project root [~/projects/mysite/]:
+Remote web root [/home/youruser/public_html/]:
+Live site URL [https://example.com]:
 Remote backup directory [~/backups/dsync]:
 
 ✓ Config saved to /home/you/.dsync/config.json
@@ -60,7 +82,7 @@ Config is stored at `~/.dsync/config.json`. Edit it directly to change settings.
 
 ---
 
-## Commands
+## 💻 Commands
 
 ### `dsync pull`
 
@@ -68,11 +90,11 @@ Pull the full site from the server to local.
 
 ```
 dsync pull
-ℹ Connecting to dubstep.cleannameservers.com:50288...
+ℹ Connecting to your-host.example.com:22...
 ✓ Connected
 ℹ Pulling site...
   ↓ index.html
-  ↓ css/custom.260105063601.css
+  ↓ css/custom.css
 ✓ 2 updated, 0 deleted
 ```
 
@@ -92,13 +114,13 @@ dsync push
 
 Files to push (2):
   index.html
-  css/custom.260105063601.css
+  css/custom.css
 
 Push 2 file(s)? [Y/n]:
 ℹ Creating server backup of changed files...
-✓ Backup at /home/dylanspa/backups/dsync/2024-01-15_14-32-01
-  ✓ index.html → https://dylansparks.com/
-  ✓ css/custom.260105063601.css → https://dylansparks.com/css/custom.260105063601.css
+✓ Backup at /home/youruser/backups/dsync/2024-01-15_14-32-01
+  ✓ index.html → https://example.com/
+  ✓ css/custom.css → https://example.com/css/custom.css
 
 ✓ 2 file(s) pushed.
 ```
@@ -106,10 +128,10 @@ Push 2 file(s)? [Y/n]:
 **With a path** — push only that file or directory:
 
 ```
-dsync push css/custom.260105063601.css
+dsync push css/custom.css
 ℹ Backing up remote file...
-✓ Uploading css/custom.260105063601.css
-✓ Done — https://dylansparks.com/css/custom.260105063601.css
+✓ Uploading css/custom.css
+✓ Done — https://example.com/css/custom.css
 ```
 
 ---
@@ -120,9 +142,9 @@ Watch the local directory and auto-push on save.
 
 ```
 dsync watch
-Watching ~/Documents/dylansparks.com/public_html/ — Ctrl+C to stop
-[14:32:01] ✓ pushed index.html → https://dylansparks.com/
-[14:32:44] ✓ pushed aboutme/index.html → https://dylansparks.com/aboutme/
+Watching ~/projects/mysite/ — Ctrl+C to stop
+[14:32:01] ✓ pushed index.html → https://example.com/
+[14:32:44] ✓ pushed aboutme/index.html → https://example.com/aboutme/
 ^C
 Stopped.
 ```
@@ -143,7 +165,7 @@ dsync status
 ┌────────────────┬────────────────────────────────┐
 │ Status         │ File                           │
 ├────────────────┼────────────────────────────────┤
-│ local newer    │ css/custom.260105063601.css     │
+│ local newer    │ css/custom.css                 │
 │ remote only    │ .htaccess.bak                  │
 └────────────────┴────────────────────────────────┘
 ```
@@ -158,10 +180,10 @@ Trigger a full server-side backup:
 
 ```
 dsync backup
-ℹ Connecting to dubstep.cleannameservers.com:50288...
+ℹ Connecting to your-host.example.com:22...
 ✓ Connected
 ℹ Archiving remote site (this may take a moment)...
-✓ Backup created: /home/dylanspa/backups/dsync/2024-01-15_14-33-00.tar.gz
+✓ Backup created: /home/youruser/backups/dsync/2024-01-15_14-33-00.tar.gz
 ```
 
 ---
@@ -172,26 +194,26 @@ Open the live URL for a local file in the default browser:
 
 ```
 dsync open aboutme/index.html
-ℹ Opening https://dylansparks.com/aboutme/
+ℹ Opening https://example.com/aboutme/
 ```
 
 With no argument, opens the site root.
 
 ---
 
-## Config reference
+## ⚙️ Config reference
 
 `~/.dsync/config.json`:
 
 ```json
 {
-  "host": "dubstep.cleannameservers.com",
-  "port": 50288,
-  "user": "dylanspa",
-  "key_path": "~/Documents/dylansparks.com/id_rsa",
-  "local_root": "~/Documents/dylansparks.com/public_html/",
-  "remote_root": "/home/dylanspa/public_html/",
-  "site_url": "https://dylansparks.com",
+  "host": "your-host.example.com",
+  "port": 22,
+  "user": "youruser",
+  "key_path": "~/.ssh/id_rsa",
+  "local_root": "~/projects/mysite/",
+  "remote_root": "/home/youruser/public_html/",
+  "site_url": "https://example.com",
   "backup_dir": "~/backups/dsync",
   "ignore_patterns": [
     ".git/",
@@ -210,9 +232,9 @@ With no argument, opens the site root.
 
 ---
 
-## How SSH auth works
+## 🔐 How SSH auth works
 
-`dsync` uses **paramiko** for direct SSH/SFTP operations (backups, single-file
+`dsync` uses **[paramiko](https://www.paramiko.org/)** for direct SSH/SFTP operations (backups, single-file
 uploads in watch mode) and **system rsync** for bulk transfers.
 
 On first use you'll be prompted for your key passphrase. It is:
@@ -226,7 +248,7 @@ The temporary agent is torn down when the process exits.
 
 ---
 
-## State file
+## 🗂️ State file
 
 After each push/pull, dsync writes `~/.dsync/state.json` — a manifest of
 every synced file's mtime, MD5 checksum, and sync timestamp. This enables
