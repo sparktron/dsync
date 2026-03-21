@@ -87,7 +87,8 @@ def _parse_itemize(output: str) -> tuple[list[str], list[str]]:
         if not line:
             continue
         if line.startswith("*deleting"):
-            path = line.split(None, 1)[1].strip() if " " in line else ""
+            parts = line.split(None, 1)
+            path = parts[1].strip() if len(parts) == 2 else ""
             if path:
                 deletions.append(path)
         elif len(line) > 12 and line[0] in ("<", ">", "c", "h") and line[1] != "d":
@@ -129,7 +130,7 @@ def rsync_pull(config: Config, state: StateManager) -> None:
         f"{len(deletions)} deleted"
     )
 
-    state.scan_directory(config.local_root)
+    state.scan_directory(config.local_root, config.ignore_patterns)
     state.save()
 
 
@@ -173,7 +174,7 @@ def rsync_push_all(config: Config, state: StateManager) -> list[str]:
         return []
 
     transfers, _ = _parse_itemize(result.stdout)
-    state.scan_directory(config.local_root)
+    state.scan_directory(config.local_root, config.ignore_patterns)
     state.save()
     return transfers
 

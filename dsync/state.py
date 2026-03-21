@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import time
@@ -99,13 +100,36 @@ class StateManager:
         """Return True if the manifest has no entries."""
         return len(self._state) == 0
 
-    def scan_directory(self, root: Path) -> None:
-        """Rebuild the full manifest by scanning a local directory."""
+    def scan_directory(self, root: Path, ignore_patterns: list[str] | None = None) -> None:
+        """Rebuild the full manifest by scanning a local directory.
+
+        Files whose relative path matches any pattern in *ignore_patterns*
+        (the same list passed to rsync --exclude) are skipped so the manifest
+        stays in sync with what rsync actually tracks.
+        """
+        ignore = ignore_patterns or []
         self._state = {}
         for file in root.rglob("*"):
-            if file.is_file():
-                rel = str(file.relative_to(root))
-                self.update(rel, file)
+            if not file.is_file():
+                continue
+            rel = str(file.relative_to(root))
+            if _matches_ignore(rel, ignore):
+                continue
+            self.update(rel, file)
+
+
+def _matches_ignore(rel_path: str, patterns: list[str]) -> bool:
+    """Return True if *rel_path* matches any rsync-style ignore pattern."""
+    parts = Path(rel_path).parts
+    for pattern in patterns:
+        # Strip trailing slash (directory marker in rsync patterns).
+        pat = pattern.rstrip("/")
+        # Match against each path component and the full relative path.
+        if any(fnmatch.fnmatch(part, pat) for part in parts):
+            return True
+        if fnmatch.fnmatch(rel_path, pat):
+            return True
+    return False
 
 
 def compute_checksum(path: Path) -> str:
