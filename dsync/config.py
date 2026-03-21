@@ -14,6 +14,7 @@ console = Console()
 
 CONFIG_DIR = Path.home() / ".dsync"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+PROFILES_DIR = CONFIG_DIR / "profiles"
 
 DEFAULT_IGNORE: list[str] = [
     ".git/",
@@ -58,26 +59,48 @@ class Config:
         }
 
 
-def load_config() -> Config:
+def _config_file(profile: str | None) -> Path:
+    """Return the config file path for the given profile."""
+    if profile is None:
+        return CONFIG_FILE
+    return PROFILES_DIR / f"{profile}.json"
+
+
+def load_config(profile: str | None = None) -> Config:
     """Load config from disk, running the first-run wizard if not found."""
-    if not CONFIG_FILE.exists():
-        return run_wizard()
-    with CONFIG_FILE.open() as f:
+    path = _config_file(profile)
+    if not path.exists():
+        return run_wizard(profile=profile)
+    with path.open() as f:
         data = json.load(f)
     return Config(data)
 
 
-def save_config(config: Config) -> None:
-    """Persist config to ~/.dsync/config.json."""
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    with CONFIG_FILE.open("w") as f:
+def save_config(config: Config, profile: str | None = None) -> None:
+    """Persist config to disk."""
+    path = _config_file(profile)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as f:
         json.dump(config.to_dict(), f, indent=2)
 
 
-def run_wizard() -> Config:
+def list_profiles() -> list[str]:
+    """Return the names of all available profiles."""
+    names: list[str] = []
+    if CONFIG_FILE.exists():
+        names.append("default")
+    if PROFILES_DIR.exists():
+        for f in sorted(PROFILES_DIR.glob("*.json")):
+            names.append(f.stem)
+    return names
+
+
+def run_wizard(profile: str | None = None) -> Config:
     """Interactive first-run configuration wizard."""
-    console.print("\n[bold blue]dsync[/] — first-run setup\n")
-    console.print("No config found at [dim]~/.dsync/config.json[/]. Let's set one up.\n")
+    profile_label = f"[dim]({profile})[/] " if profile else ""
+    console.print(f"\n[bold blue]dsync[/] {profile_label}— first-run setup\n")
+    path = _config_file(profile)
+    console.print(f"No config found at [dim]{path}[/]. Let's set one up.\n")
 
     host = Prompt.ask("SSH host", default="dubstep.cleannameservers.com")
     port = int(Prompt.ask("SSH port", default="50288"))
@@ -110,6 +133,6 @@ def run_wizard() -> Config:
     }
 
     config = Config(data)
-    save_config(config)
-    console.print(f"\n[green]✓[/] Config saved to [dim]{CONFIG_FILE}[/]\n")
+    save_config(config, profile=profile)
+    console.print(f"\n[green]✓[/] Config saved to [dim]{path}[/]\n")
     return config

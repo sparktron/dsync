@@ -10,7 +10,7 @@ import click
 from rich.console import Console
 from rich.table import Table
 
-from .config import load_config
+from .config import load_config, list_profiles
 from .ssh import SSHManager
 from .state import StateManager
 from .sync import (
@@ -30,8 +30,12 @@ console = Console()
 
 
 @click.group()
-def cli() -> None:
+@click.option("--profile", "-p", default=None, metavar="NAME", help="Config profile name.")
+@click.pass_context
+def cli(ctx: click.Context, profile: str | None) -> None:
     """dsync — SSH deploy tool for dylansparks.com."""
+    ctx.ensure_object(dict)
+    ctx.obj["profile"] = profile
 
 
 # ---------------------------------------------------------------------------
@@ -40,10 +44,12 @@ def cli() -> None:
 
 
 @cli.command()
-def pull() -> None:
+@click.pass_context
+def pull(ctx: click.Context) -> None:
     """Pull the full site from the server to local."""
-    config = load_config()
-    state = StateManager()
+    profile = ctx.obj["profile"]
+    config = load_config(profile=profile)
+    state = StateManager(profile=profile)
 
     if not state.is_empty():
         console.print(
@@ -64,7 +70,8 @@ def pull() -> None:
 
 @cli.command()
 @click.argument("path", required=False)
-def push(path: str | None) -> None:
+@click.pass_context
+def push(ctx: click.Context, path: str | None) -> None:
     """
     Push local changes to the server.
 
@@ -72,8 +79,9 @@ def push(path: str | None) -> None:
     files, prompts for confirmation, then syncs.  With PATH, pushes only
     that specific file or directory.
     """
-    config = load_config()
-    state = StateManager()
+    profile = ctx.obj["profile"]
+    config = load_config(profile=profile)
+    state = StateManager(profile=profile)
 
     with SSHManager(config) as ssh:
         if path:
@@ -156,10 +164,12 @@ def _push_all_interactive(
 
 
 @cli.command()
-def watch() -> None:
+@click.pass_context
+def watch(ctx: click.Context) -> None:
     """Watch local files and auto-push on save."""
-    config = load_config()
-    state = StateManager()
+    profile = ctx.obj["profile"]
+    config = load_config(profile=profile)
+    state = StateManager(profile=profile)
     ssh = SSHManager(config)
     ssh.connect()
 
@@ -198,9 +208,11 @@ def watch() -> None:
 
 
 @cli.command()
-def status() -> None:
+@click.pass_context
+def status(ctx: click.Context) -> None:
     """Show diff between local and remote — which files are out of sync."""
-    config = load_config()
+    profile = ctx.obj["profile"]
+    config = load_config(profile=profile)
     console.print("[blue]ℹ[/] Comparing local vs remote (this may take a moment)...")
 
     groups = rsync_status(config)
@@ -232,9 +244,11 @@ def status() -> None:
 
 
 @cli.command()
-def backup() -> None:
+@click.pass_context
+def backup(ctx: click.Context) -> None:
     """Trigger a full server-side backup to ~/backups/dsync/."""
-    config = load_config()
+    profile = ctx.obj["profile"]
+    config = load_config(profile=profile)
     with SSHManager(config) as ssh:
         backup_path = create_full_backup(ssh, config)
         console.print(f"[green]✓[/] Backup created: {backup_path}")
@@ -247,9 +261,11 @@ def backup() -> None:
 
 @cli.command("open")
 @click.argument("path", required=False)
-def open_url(path: str | None) -> None:
+@click.pass_context
+def open_url(ctx: click.Context, path: str | None) -> None:
     """Open the live URL for a local file path in the default browser."""
-    config = load_config()
+    profile = ctx.obj["profile"]
+    config = load_config(profile=profile)
 
     if path:
         rel_path = path.lstrip("/")
@@ -266,3 +282,25 @@ def open_url(path: str | None) -> None:
 
     console.print(f"[blue]ℹ[/] Opening {url}")
     webbrowser.open(url)
+
+
+# ---------------------------------------------------------------------------
+# profiles
+# ---------------------------------------------------------------------------
+
+
+@cli.command("profiles")
+def profiles_cmd() -> None:
+    """List available configuration profiles."""
+    names = list_profiles()
+    if not names:
+        console.print(
+            "[dim]No profiles found. Run [bold]dsync[/] to set up a default profile.[/]"
+        )
+        return
+    console.print("[bold]Available profiles:[/]")
+    for name in names:
+        console.print(f"  [cyan]{name}[/]")
+    console.print(
+        "\n[dim]Use [bold]dsync --profile NAME <command>[/] to target a specific profile.[/]"
+    )
