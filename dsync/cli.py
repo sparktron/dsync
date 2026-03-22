@@ -37,7 +37,9 @@ console = Console()
 
 
 @click.group()
-@click.option("--profile", "-p", default=None, metavar="NAME", help="Config profile name.")
+@click.option(
+    "--profile", "-p", default=None, metavar="NAME", help="Config profile name."
+)
 @click.pass_context
 def cli(ctx: click.Context, profile: str | None) -> None:
     """dsync — SSH deploy tool for dylansparks.com."""
@@ -72,7 +74,13 @@ def pull(ctx: click.Context) -> None:
     t0 = time.monotonic()
     with SSHManager(config) as ssh:  # noqa: F841  (establishes connection + verifies auth)
         rsync_pull(config, state)
-    append_log("pull", [], ok=True, duration_ms=int((time.monotonic() - t0) * 1000), profile=profile)
+    append_log(
+        "pull",
+        [],
+        ok=True,
+        duration_ms=int((time.monotonic() - t0) * 1000),
+        profile=profile,
+    )
     run_hook(config, "post_pull")
 
 
@@ -83,7 +91,9 @@ def pull(ctx: click.Context) -> None:
 
 @cli.command()
 @click.argument("path", required=False)
-@click.option("--diff", "show_diff", is_flag=True, help="Show file diffs before pushing.")
+@click.option(
+    "--diff", "show_diff", is_flag=True, help="Show file diffs before pushing."
+)
 @click.pass_context
 def push(ctx: click.Context, path: str | None, show_diff: bool) -> None:
     """
@@ -105,18 +115,28 @@ def push(ctx: click.Context, path: str | None, show_diff: bool) -> None:
     with SSHManager(config) as ssh:
         if path:
             deployed = _push_path(ssh, config, state, path)
-            append_log("push", [path], ok=deployed, duration_ms=int((time.monotonic() - t0) * 1000), profile=profile)
+            append_log(
+                "push",
+                [path],
+                ok=deployed,
+                duration_ms=int((time.monotonic() - t0) * 1000),
+                profile=profile,
+            )
         else:
             transferred = _push_all_interactive(ssh, config, state, show_diff=show_diff)
             deployed = len(transferred) > 0
-            append_log("push", transferred, ok=deployed, duration_ms=int((time.monotonic() - t0) * 1000), profile=profile)
+            append_log(
+                "push",
+                transferred,
+                ok=deployed,
+                duration_ms=int((time.monotonic() - t0) * 1000),
+                profile=profile,
+            )
     if deployed:
         run_hook(config, "post_push")
 
 
-def _push_path(
-    ssh: SSHManager, config, state: StateManager, path: str
-) -> bool:
+def _push_path(ssh: SSHManager, config, state: StateManager, path: str) -> bool:
     """Push a specific file or directory. Returns True if files were deployed."""
     rel_path = path.lstrip("/")
 
@@ -206,12 +226,14 @@ def _show_push_diffs(ssh: SSHManager, config, changed: list[str]) -> None:
             remote_text = buf.getvalue().decode("utf-8", errors="replace")
         except Exception:
             remote_text = ""  # new file — show full content as addition
-        diff_lines = list(difflib.unified_diff(
-            remote_text.splitlines(keepends=True),
-            local_text.splitlines(keepends=True),
-            fromfile=f"remote/{rel_path}",
-            tofile=f"local/{rel_path}",
-        ))
+        diff_lines = list(
+            difflib.unified_diff(
+                remote_text.splitlines(keepends=True),
+                local_text.splitlines(keepends=True),
+                fromfile=f"remote/{rel_path}",
+                tofile=f"local/{rel_path}",
+            )
+        )
         if not diff_lines:
             console.print(f"\n  [dim]{rel_path} — no text diff (metadata only)[/]")
             continue
@@ -249,13 +271,21 @@ def watch(ctx: click.Context) -> None:
         if success:
             _retry_state.pop(rel_path, None)
             url = file_to_url(config, rel_path)
-            console.print(f"[dim][{timestamp}][/] [green]✓[/] pushed {rel_path} → {url}")
-            append_log("watch_push", [rel_path], ok=True, duration_ms=duration_ms, profile=profile)
+            console.print(
+                f"[dim][{timestamp}][/] [green]✓[/] pushed {rel_path} → {url}"
+            )
+            append_log(
+                "watch_push",
+                [rel_path],
+                ok=True,
+                duration_ms=duration_ms,
+                profile=profile,
+            )
         else:
             entry = _retry_state.get(rel_path, {"count": 0})
             count = entry["count"] + 1
             if count < MAX_RETRIES:
-                delay = 2 ** count  # 2s, 4s
+                delay = 2**count  # 2s, 4s
                 console.print(
                     f"[dim][{timestamp}][/] [yellow]⚠[/] failed {rel_path} "
                     f"(retry {count}/{MAX_RETRIES - 1} in {delay}s)"
@@ -270,7 +300,13 @@ def watch(ctx: click.Context) -> None:
                 )
                 failures.append(rel_path)
                 _retry_state.pop(rel_path, None)
-                append_log("watch_push", [rel_path], ok=False, duration_ms=duration_ms, profile=profile)
+                append_log(
+                    "watch_push",
+                    [rel_path],
+                    ok=False,
+                    duration_ms=duration_ms,
+                    profile=profile,
+                )
 
     def on_change(rel_path: str) -> None:
         # Cancel any pending retry before attempting a fresh upload.
@@ -294,8 +330,7 @@ def watch(ctx: click.Context) -> None:
         ssh.close()
         if failures:
             console.print(
-                f"\n[red]Failed uploads ({len(failures)}):[/] "
-                + ", ".join(failures)
+                f"\n[red]Failed uploads ({len(failures)}):[/] " + ", ".join(failures)
             )
 
 
@@ -306,7 +341,9 @@ def watch(ctx: click.Context) -> None:
 
 @cli.command()
 @click.option(
-    "--local", "local_only", is_flag=True,
+    "--local",
+    "local_only",
+    is_flag=True,
     help="Fast local-only check against last sync state (no network).",
 )
 @click.pass_context
@@ -381,7 +418,9 @@ def _status_local(config, state: StateManager) -> None:
         console.print("[green]✓[/] No local changes since last sync.")
         return
 
-    table = Table(title="Local Status (vs last sync)", show_header=True, header_style="bold")
+    table = Table(
+        title="Local Status (vs last sync)", show_header=True, header_style="bold"
+    )
     table.add_column("Status", min_width=12)
     table.add_column("File")
 
@@ -413,7 +452,13 @@ def backup(ctx: click.Context) -> None:
     with SSHManager(config) as ssh:
         backup_path = create_full_backup(ssh, config)
         console.print(f"[green]✓[/] Backup created: {backup_path}")
-    append_log("backup", [], ok=True, duration_ms=int((time.monotonic() - t0) * 1000), profile=profile)
+    append_log(
+        "backup",
+        [],
+        ok=True,
+        duration_ms=int((time.monotonic() - t0) * 1000),
+        profile=profile,
+    )
 
 
 # ---------------------------------------------------------------------------

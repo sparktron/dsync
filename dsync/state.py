@@ -116,7 +116,9 @@ class StateManager:
         """Return True if the manifest has no entries."""
         return len(self._state) == 0
 
-    def scan_directory(self, root: Path, ignore_patterns: list[str] | None = None) -> None:
+    def scan_directory(
+        self, root: Path, ignore_patterns: list[str] | None = None
+    ) -> None:
         """Rebuild the full manifest by scanning a local directory.
 
         Files whose relative path matches any pattern in *ignore_patterns*
