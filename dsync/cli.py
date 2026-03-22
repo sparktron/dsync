@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 import webbrowser
 from datetime import datetime
 from pathlib import Path
@@ -11,6 +12,7 @@ from rich.console import Console
 from rich.table import Table
 
 from .config import load_config, list_profiles
+from .log import append_log, read_log
 from .ssh import SSHManager
 from .state import StateManager
 from .sync import (
@@ -59,8 +61,10 @@ def pull(ctx: click.Context) -> None:
         if not click.confirm("Continue?", default=True):
             return
 
+    t0 = time.monotonic()
     with SSHManager(config) as ssh:  # noqa: F841  (establishes connection + verifies auth)
         rsync_pull(config, state)
+    append_log("pull", [], ok=True, duration_ms=int((time.monotonic() - t0) * 1000), profile=profile)
 
 
 # ---------------------------------------------------------------------------
@@ -83,11 +87,14 @@ def push(ctx: click.Context, path: str | None) -> None:
     config = load_config(profile=profile)
     state = StateManager(profile=profile)
 
+    t0 = time.monotonic()
     with SSHManager(config) as ssh:
         if path:
             _push_path(ssh, config, state, path)
+            append_log("push", [path], ok=True, duration_ms=int((time.monotonic() - t0) * 1000), profile=profile)
         else:
-            _push_all_interactive(ssh, config, state)
+            transferred = _push_all_interactive(ssh, config, state)
+            append_log("push", transferred, ok=True, duration_ms=int((time.monotonic() - t0) * 1000), profile=profile)
 
 
 def _push_path(
@@ -127,21 +134,21 @@ def _push_path(
 
 def _push_all_interactive(
     ssh: SSHManager, config, state: StateManager
-) -> None:
-    """Full push: diff → confirm → backup → sync."""
+) -> list[str]:
+    """Full push: diff → confirm → backup → sync. Returns list of transferred files."""
     console.print("[blue]ℹ[/] Computing changes...")
     changed = rsync_push_dry_run(config)
 
     if not changed:
         console.print("[green]✓[/] Everything is in sync.")
-        return
+        return []
 
     console.print(f"\n[bold]Files to push[/] ({len(changed)}):")
     for f in changed:
         console.print(f"  [cyan]{f}[/]")
 
     if not click.confirm(f"\nPush {len(changed)} file(s)?", default=True):
-        return
+        return []
 
     console.print("[blue]ℹ[/] Creating server backup of changed files...")
     try:
@@ -156,6 +163,7 @@ def _push_all_interactive(
         url = file_to_url(config, f)
         console.print(f"  [green]✓[/] {f} → {url}")
     console.print(f"\n[green]✓[/] {len(transferred)} file(s) pushed.")
+    return transferred
 
 
 # ---------------------------------------------------------------------------
@@ -180,15 +188,19 @@ def watch(ctx: click.Context) -> None:
         local_path = config.local_root / rel_path
         if not local_path.exists():
             return
+        t0 = time.monotonic()
         success = push_single_file(ssh, config, state, rel_path)
+        duration_ms = int((time.monotonic() - t0) * 1000)
         if success:
             url = file_to_url(config, rel_path)
             console.print(
                 f"[dim][{timestamp}][/] [green]✓[/] pushed {rel_path} → {url}"
             )
+            append_log("watch_push", [rel_path], ok=True, duration_ms=duration_ms, profile=profile)
         else:
             console.print(f"[dim][{timestamp}][/] [red]✗[/] failed  {rel_path}")
             failures.append(rel_path)
+            append_log("watch_push", [rel_path], ok=False, duration_ms=duration_ms, profile=profile)
 
     watcher = FileWatcher(config, on_change)
     try:
@@ -249,9 +261,11 @@ def backup(ctx: click.Context) -> None:
     """Trigger a full server-side backup to ~/backups/dsync/."""
     profile = ctx.obj["profile"]
     config = load_config(profile=profile)
+    t0 = time.monotonic()
     with SSHManager(config) as ssh:
         backup_path = create_full_backup(ssh, config)
         console.print(f"[green]✓[/] Backup created: {backup_path}")
+    append_log("backup", [], ok=True, duration_ms=int((time.monotonic() - t0) * 1000), profile=profile)
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +296,44 @@ def open_url(ctx: click.Context, path: str | None) -> None:
 
     console.print(f"[blue]ℹ[/] Opening {url}")
     webbrowser.open(url)
+
+
+# ---------------------------------------------------------------------------
+# log
+# ---------------------------------------------------------------------------
+
+
+@cli.command("log")
+@click.option("-n", default=20, show_default=True, help="Number of entries to show.")
+def show_log(n: int) -> None:
+    """Show recent sync operation history."""
+    entries = read_log(n=n)
+    if not entries:
+        console.print("[dim]No log entries yet.[/]")
+        return
+
+    table = Table(title="Sync Log", show_header=True, header_style="bold")
+    table.add_column("Time", min_width=19)
+    table.add_column("Action", min_width=10)
+    table.add_column("Files", min_width=5, justify="right")
+    table.add_column("Duration")
+    table.add_column("Status", min_width=6)
+    table.add_column("Profile")
+
+    for e in entries:
+        status_str = "[green]ok[/]" if e.get("ok") else "[red]failed[/]"
+        ms = e.get("ms", 0)
+        duration_str = f"{ms / 1000:.1f}s" if ms >= 1000 else f"{ms}ms"
+        table.add_row(
+            e.get("ts", ""),
+            e.get("action", ""),
+            str(len(e.get("files", []))),
+            duration_str,
+            status_str,
+            e.get("profile") or "[dim]default[/]",
+        )
+
+    console.print(table)
 
 
 # ---------------------------------------------------------------------------
