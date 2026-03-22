@@ -9,7 +9,22 @@ import time
 from pathlib import Path
 from typing import Any, Iterator
 
-STATE_FILE = Path.home() / ".dsync" / "state.json"
+_STATE_DIR = Path.home() / ".dsync"
+
+# Module-level constant kept for backward compatibility.
+STATE_FILE = _STATE_DIR / "state.json"
+
+
+def _state_file_for(profile: str | None) -> Path:
+    """Return the state file path for the given profile.
+
+    ``None`` and ``"default"`` both resolve to the legacy
+    ``~/.dsync/state.json`` to keep the default profile aligned with
+    existing environments.
+    """
+    if profile is None or profile == "default":
+        return STATE_FILE
+    return _STATE_DIR / f"state_{profile}.json"
 
 
 class FileState:
@@ -40,22 +55,23 @@ class FileState:
 
 class StateManager:
     """
-    Manages the dsync state manifest at ~/.dsync/state.json.
+    Manages the dsync state manifest at ~/.dsync/state[_profile].json.
 
     The manifest maps relative file paths to their last-known mtime,
     checksum, and sync timestamp.  Used for fast local diffing without
     requiring a full remote scan every time.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, profile: str | None = None) -> None:
+        self._state_file = _state_file_for(profile)
         self._state: dict[str, FileState] = {}
         self._load()
 
     def _load(self) -> None:
         """Load state from disk if it exists."""
-        if STATE_FILE.exists():
+        if self._state_file.exists():
             try:
-                with STATE_FILE.open() as f:
+                with self._state_file.open() as f:
                     raw: dict[str, Any] = json.load(f)
                 self._state = {
                     path: FileState.from_dict(entry) for path, entry in raw.items()
@@ -66,8 +82,8 @@ class StateManager:
 
     def save(self) -> None:
         """Persist state to disk."""
-        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with STATE_FILE.open("w") as f:
+        self._state_file.parent.mkdir(parents=True, exist_ok=True)
+        with self._state_file.open("w") as f:
             json.dump(
                 {path: entry.to_dict() for path, entry in self._state.items()},
                 f,
@@ -100,7 +116,9 @@ class StateManager:
         """Return True if the manifest has no entries."""
         return len(self._state) == 0
 
-    def scan_directory(self, root: Path, ignore_patterns: list[str] | None = None) -> None:
+    def scan_directory(
+        self, root: Path, ignore_patterns: list[str] | None = None
+    ) -> None:
         """Rebuild the full manifest by scanning a local directory.
 
         Files whose relative path matches any pattern in *ignore_patterns*

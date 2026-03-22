@@ -28,9 +28,7 @@ def get_passphrase() -> str:
     """Prompt for the SSH key passphrase once, caching it for the session."""
     global _passphrase_cache
     if _passphrase_cache is None:
-        _passphrase_cache = Prompt.ask(
-            "[yellow]SSH key passphrase[/]", password=True
-        )
+        _passphrase_cache = Prompt.ask("[yellow]SSH key passphrase[/]", password=True)
     return _passphrase_cache
 
 
@@ -50,9 +48,7 @@ def get_rsync_env(key_path: Path) -> dict[str, str]:
 
     # If the user already has an agent running with the key loaded, use it.
     if "SSH_AUTH_SOCK" in os.environ:
-        listed = subprocess.run(
-            ["ssh-add", "-l"], capture_output=True, text=True
-        )
+        listed = subprocess.run(["ssh-add", "-l"], capture_output=True, text=True)
         keygen = subprocess.run(
             ["ssh-keygen", "-l", "-f", str(key_path)],
             capture_output=True,
@@ -66,9 +62,7 @@ def get_rsync_env(key_path: Path) -> dict[str, str]:
 
     # Start a fresh ssh-agent.
     passphrase = get_passphrase()
-    agent_result = subprocess.run(
-        ["ssh-agent", "-s"], capture_output=True, text=True
-    )
+    agent_result = subprocess.run(["ssh-agent", "-s"], capture_output=True, text=True)
     new_env: dict[str, str] = {}
     for line in agent_result.stdout.splitlines():
         m = re.match(r"(\w+)=([^;]+);", line)
@@ -139,9 +133,7 @@ class SSHManager:
             console.print("[green]✓[/] Connected")
         except Exception as exc:
             if retry:
-                console.print(
-                    f"[red]✗[/] Connection failed: {exc}. Retrying in 3 s..."
-                )
+                console.print(f"[red]✗[/] Connection failed: {exc}. Retrying in 3 s...")
                 time.sleep(3)
                 self._do_connect()
                 console.print("[green]✓[/] Connected")

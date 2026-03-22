@@ -110,7 +110,8 @@ def rsync_pull(config: Config, state: StateManager) -> None:
 
     console.print("[blue]ℹ[/] Pulling site...")
     with Progress(
-        SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
         transient=True,
     ) as progress:
         progress.add_task("Syncing from server...", total=None)
@@ -125,10 +126,7 @@ def rsync_pull(config: Config, state: StateManager) -> None:
         console.print(f"  [green]↓[/] {f}")
     for f in deletions:
         console.print(f"  [red]✗[/] deleted locally: {f}")
-    console.print(
-        f"\n[green]✓[/] {len(transfers)} updated, "
-        f"{len(deletions)} deleted"
-    )
+    console.print(f"\n[green]✓[/] {len(transfers)} updated, {len(deletions)} deleted")
 
     state.scan_directory(config.local_root, config.ignore_patterns)
     state.save()
@@ -163,7 +161,8 @@ def rsync_push_all(config: Config, state: StateManager) -> list[str]:
     remote_dst = f"{config.user}@{config.host}:{config.remote_root}"
 
     with Progress(
-        SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
         transient=True,
     ) as progress:
         progress.add_task("Syncing to server...", total=None)
@@ -306,9 +305,7 @@ def _remote_backup_base(config: Config) -> str:
     return config.backup_dir.replace("~", f"/home/{config.user}")
 
 
-def _backup_remote_file(
-    ssh: SSHManager, config: Config, rel_path: str
-) -> None:
+def _backup_remote_file(ssh: SSHManager, config: Config, rel_path: str) -> None:
     """Copy a single remote file to the timestamped backup directory."""
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     backup_base = _remote_backup_base(config)
@@ -317,15 +314,12 @@ def _backup_remote_file(
     remote_file = config.remote_root + rel_path
     ssh.run(f"mkdir -p {shlex.quote(backup_base)}")
     ssh.run(
-        f"cp {shlex.quote(remote_file)} {shlex.quote(backup_path)} "
-        f"2>/dev/null || true",
+        f"cp {shlex.quote(remote_file)} {shlex.quote(backup_path)} 2>/dev/null || true",
         check=False,
     )
 
 
-def backup_remote_files(
-    ssh: SSHManager, config: Config, rel_paths: list[str]
-) -> str:
+def backup_remote_files(ssh: SSHManager, config: Config, rel_paths: list[str]) -> str:
     """
     Back up a specific set of remote files before overwriting them.
 
@@ -360,10 +354,40 @@ def create_full_backup(ssh: SSHManager, config: Config) -> str:
     ssh.run(f"mkdir -p {shlex.quote(backup_base)}")
     console.print("[blue]ℹ[/] Archiving remote site (this may take a moment)...")
     ssh.run(
-        f"tar -czf {shlex.quote(backup_path)} "
-        f"-C {shlex.quote(config.remote_root)} ."
+        f"tar -czf {shlex.quote(backup_path)} -C {shlex.quote(config.remote_root)} ."
     )
     return backup_path
+
+
+# ---------------------------------------------------------------------------
+# Hook runner
+# ---------------------------------------------------------------------------
+
+
+def run_hook(config: Config, hook: str) -> bool:
+    """
+    Run a named hook command from config (e.g. 'pre_push', 'post_push').
+
+    The command is executed in a shell with the local_root as the working
+    directory. Returns True if the hook succeeded (or was not configured).
+    """
+    cmd = config.hooks.get(hook)
+    if not cmd:
+        return True
+
+    console.print(f"[blue]ℹ[/] Running hook [bold]{hook}[/]: {cmd}")
+    result = subprocess.run(
+        cmd,
+        shell=True,
+        cwd=str(config.local_root),
+        text=True,
+    )
+    if result.returncode != 0:
+        console.print(
+            f"[red]✗[/] Hook [bold]{hook}[/] failed (exit {result.returncode})"
+        )
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------

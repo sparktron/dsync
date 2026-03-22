@@ -131,8 +131,7 @@ class FileWatcher:
         observer.start()
 
         console.print(
-            f"[blue]Watching[/] {self.config.local_root} "
-            "— [dim]Ctrl+C to stop[/]"
+            f"[blue]Watching[/] {self.config.local_root} — [dim]Ctrl+C to stop[/]"
         )
         try:
             while True:
