@@ -5,6 +5,7 @@
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue?logo=python&logoColor=white)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![rsync](https://img.shields.io/badge/powered%20by-rsync-orange)](https://rsync.samba.org/)
+[![CI](https://github.com/sparktron/dsync/actions/workflows/ci.yml/badge.svg)](https://github.com/sparktron/dsync/actions/workflows/ci.yml)
 
 Edit files locally, sync them to cPanel shared hosting over SSH/rsync.
 No build step. No framework. Just files.
@@ -26,6 +27,7 @@ No build step. No framework. Just files.
 - [Config reference](#-config-reference)
 - [How SSH auth works](#-how-ssh-auth-works)
 - [State file](#-state-file)
+- [Development](#-development)
 
 ---
 
@@ -253,3 +255,23 @@ The temporary agent is torn down when the process exits.
 After each push/pull, dsync writes `~/.dsync/state.json` — a manifest of
 every synced file's mtime, MD5 checksum, and sync timestamp. This enables
 fast local diffing without rescanning the server.
+
+---
+
+## 🛠️ Development
+
+Install the package with dev dependencies:
+
+```bash
+pip install -e ".[dev]"
+```
+
+Run the linter:
+
+```bash
+ruff check dsync/
+ruff format --check dsync/
+```
+
+CI runs automatically on every push and PR via [GitHub Actions](.github/workflows/ci.yml),
+checking lint and verifying the package installs cleanly across Python 3.9–3.12.
