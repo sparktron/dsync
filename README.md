@@ -1,6 +1,6 @@
 # 🔄 dsync
 
-> SSH deploy tool for personal sites on cPanel shared hosting.
+> SSH deploy tool for personal sites on cPanel shared hosting.  Basically a purpose-built wrapper around rsync (and paramiko/SFTP) for a specific personal deployment workflow.
 
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue?logo=python&logoColor=white)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
