@@ -18,7 +18,7 @@ from rich.table import Table
 from .config import load_config, list_profiles
 from .log import append_log, read_log
 from .ssh import SSHManager
-from .state import StateManager
+from .state import StateManager, _matches_ignore
 from .sync import (
     backup_remote_files,
     create_full_backup,
@@ -294,11 +294,21 @@ def watch(ctx: click.Context) -> None:
 
 
 @cli.command()
+@click.option(
+    "--local", "local_only", is_flag=True,
+    help="Fast local-only check against last sync state (no network).",
+)
 @click.pass_context
-def status(ctx: click.Context) -> None:
+def status(ctx: click.Context, local_only: bool) -> None:
     """Show diff between local and remote — which files are out of sync."""
     profile = ctx.obj["profile"]
     config = load_config(profile=profile)
+
+    if local_only:
+        state = StateManager(profile=profile)
+        _status_local(config, state)
+        return
+
     console.print("[blue]ℹ[/] Comparing local vs remote (this may take a moment)...")
 
     groups = rsync_status(config)
@@ -322,6 +332,59 @@ def status(ctx: click.Context) -> None:
         table.add_row("[magenta]remote only[/]", f)
 
     console.print(table)
+
+
+def _status_local(config, state: StateManager) -> None:
+    """Fast local-only status: compare local files against the sync state manifest."""
+    if state.is_empty():
+        console.print(
+            "[yellow]⚠[/] No sync state found. "
+            "Run [bold]dsync pull[/] or [bold]dsync push[/] first."
+        )
+        return
+
+    modified: list[str] = []
+    deleted: list[str] = []
+    seen: set[str] = set()
+
+    for rel_path, file_state in state.items():
+        seen.add(rel_path)
+        local_path = config.local_root / rel_path
+        if not local_path.exists():
+            deleted.append(rel_path)
+        elif local_path.stat().st_mtime != file_state.mtime:
+            modified.append(rel_path)
+
+    new_files: list[str] = []
+    for local_file in config.local_root.rglob("*"):
+        if not local_file.is_file():
+            continue
+        rel = str(local_file.relative_to(config.local_root))
+        if _matches_ignore(rel, config.ignore_patterns):
+            continue
+        if rel not in seen:
+            new_files.append(rel)
+
+    total = len(modified) + len(new_files) + len(deleted)
+    if total == 0:
+        console.print("[green]✓[/] No local changes since last sync.")
+        return
+
+    table = Table(title="Local Status (vs last sync)", show_header=True, header_style="bold")
+    table.add_column("Status", min_width=12)
+    table.add_column("File")
+
+    for f in sorted(modified):
+        table.add_row("[yellow]modified[/]", f)
+    for f in sorted(new_files):
+        table.add_row("[cyan]new[/]", f)
+    for f in sorted(deleted):
+        table.add_row("[red]deleted[/]", f)
+
+    console.print(table)
+    console.print(
+        "\n[dim]Local check only — run [bold]dsync status[/] to compare with remote.[/]"
+    )
 
 
 # ---------------------------------------------------------------------------
