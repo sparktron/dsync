@@ -25,6 +25,7 @@ from .sync import (
     rsync_push_dry_run,
     rsync_pull,
     rsync_status,
+    run_hook,
 )
 from .watcher import FileWatcher
 
@@ -61,10 +62,14 @@ def pull(ctx: click.Context) -> None:
         if not click.confirm("Continue?", default=True):
             return
 
+    if not run_hook(config, "pre_pull"):
+        return
+
     t0 = time.monotonic()
     with SSHManager(config) as ssh:  # noqa: F841  (establishes connection + verifies auth)
         rsync_pull(config, state)
     append_log("pull", [], ok=True, duration_ms=int((time.monotonic() - t0) * 1000), profile=profile)
+    run_hook(config, "post_pull")
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +92,9 @@ def push(ctx: click.Context, path: str | None) -> None:
     config = load_config(profile=profile)
     state = StateManager(profile=profile)
 
+    if not run_hook(config, "pre_push"):
+        return
+
     t0 = time.monotonic()
     with SSHManager(config) as ssh:
         if path:
@@ -95,6 +103,7 @@ def push(ctx: click.Context, path: str | None) -> None:
         else:
             transferred = _push_all_interactive(ssh, config, state)
             append_log("push", transferred, ok=True, duration_ms=int((time.monotonic() - t0) * 1000), profile=profile)
+    run_hook(config, "post_push")
 
 
 def _push_path(

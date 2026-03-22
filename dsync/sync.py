@@ -367,6 +367,35 @@ def create_full_backup(ssh: SSHManager, config: Config) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Hook runner
+# ---------------------------------------------------------------------------
+
+
+def run_hook(config: Config, hook: str) -> bool:
+    """
+    Run a named hook command from config (e.g. 'pre_push', 'post_push').
+
+    The command is executed in a shell with the local_root as the working
+    directory. Returns True if the hook succeeded (or was not configured).
+    """
+    cmd = config.hooks.get(hook)
+    if not cmd:
+        return True
+
+    console.print(f"[blue]ℹ[/] Running hook [bold]{hook}[/]: {cmd}")
+    result = subprocess.run(
+        cmd,
+        shell=True,
+        cwd=str(config.local_root),
+        text=True,
+    )
+    if result.returncode != 0:
+        console.print(f"[red]✗[/] Hook [bold]{hook}[/] failed (exit {result.returncode})")
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
 # URL helper
 # ---------------------------------------------------------------------------
 

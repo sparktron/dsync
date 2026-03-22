@@ -43,6 +43,7 @@ class Config:
         self.site_url: str = data["site_url"].rstrip("/")
         self.backup_dir: str = data.get("backup_dir", "~/backups/dsync")
         self.ignore_patterns: list[str] = data.get("ignore_patterns", DEFAULT_IGNORE)
+        self.hooks: dict[str, str] = data.get("hooks", {})
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize config to a JSON-compatible dict."""
@@ -56,6 +57,7 @@ class Config:
             "site_url": self.site_url,
             "backup_dir": self.backup_dir,
             "ignore_patterns": self.ignore_patterns,
+            "hooks": self.hooks,
         }
 
 
