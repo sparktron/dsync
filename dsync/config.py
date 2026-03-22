@@ -6,7 +6,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-import click
 from rich.console import Console
 from rich.prompt import Prompt
 
@@ -62,8 +61,13 @@ class Config:
 
 
 def _config_file(profile: str | None) -> Path:
-    """Return the config file path for the given profile."""
-    if profile is None:
+    """Return the config file path for the given profile.
+
+    ``None`` and the reserved name ``"default"`` both resolve to the legacy
+    ``~/.dsync/config.json`` so that existing installs are unaffected when
+    users pass ``--profile default``.
+    """
+    if profile is None or profile == "default":
         return CONFIG_FILE
     return PROFILES_DIR / f"{profile}.json"
 

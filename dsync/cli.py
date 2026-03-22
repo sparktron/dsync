@@ -101,20 +101,23 @@ def push(ctx: click.Context, path: str | None, show_diff: bool) -> None:
         return
 
     t0 = time.monotonic()
+    deployed = False
     with SSHManager(config) as ssh:
         if path:
-            _push_path(ssh, config, state, path)
-            append_log("push", [path], ok=True, duration_ms=int((time.monotonic() - t0) * 1000), profile=profile)
+            deployed = _push_path(ssh, config, state, path)
+            append_log("push", [path], ok=deployed, duration_ms=int((time.monotonic() - t0) * 1000), profile=profile)
         else:
             transferred = _push_all_interactive(ssh, config, state, show_diff=show_diff)
-            append_log("push", transferred, ok=True, duration_ms=int((time.monotonic() - t0) * 1000), profile=profile)
-    run_hook(config, "post_push")
+            deployed = len(transferred) > 0
+            append_log("push", transferred, ok=deployed, duration_ms=int((time.monotonic() - t0) * 1000), profile=profile)
+    if deployed:
+        run_hook(config, "post_push")
 
 
 def _push_path(
     ssh: SSHManager, config, state: StateManager, path: str
-) -> None:
-    """Push a specific file or directory."""
+) -> bool:
+    """Push a specific file or directory. Returns True if files were deployed."""
     rel_path = path.lstrip("/")
 
     # Allow both absolute local paths and paths relative to local_root.
@@ -128,14 +131,15 @@ def _push_path(
     local_path = config.local_root / rel_path
     if not local_path.exists():
         console.print(f"[red]✗[/] Path not found: {local_path}")
-        return
+        return False
 
     if local_path.is_file():
-        console.print(f"[blue]ℹ[/] Backing up remote file...")
+        console.print("[blue]ℹ[/] Backing up remote file...")
         success = push_single_file(ssh, config, state, rel_path)
         if success:
             url = file_to_url(config, rel_path)
             console.print(f"[green]✓[/] Done — {url}")
+        return success
     else:
         # Directory — use rsync for the subtree.
         console.print(f"[blue]ℹ[/] Pushing directory: {rel_path}/")
@@ -144,6 +148,7 @@ def _push_path(
             url = file_to_url(config, f)
             console.print(f"  [green]✓[/] {f} → {url}")
         console.print(f"\n[green]✓[/] {len(transferred)} file(s) pushed.")
+        return len(transferred) > 0
 
 
 def _push_all_interactive(
@@ -280,6 +285,12 @@ def watch(ctx: click.Context) -> None:
     try:
         watcher.run()
     finally:
+        # Cancel any pending retry timers before closing the SSH connection.
+        for entry in list(_retry_state.values()):
+            t = entry.get("timer")
+            if t:
+                t.cancel()
+        _retry_state.clear()
         ssh.close()
         if failures:
             console.print(

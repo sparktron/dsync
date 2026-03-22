@@ -16,8 +16,13 @@ STATE_FILE = _STATE_DIR / "state.json"
 
 
 def _state_file_for(profile: str | None) -> Path:
-    """Return the state file path for the given profile."""
-    if profile is None:
+    """Return the state file path for the given profile.
+
+    ``None`` and ``"default"`` both resolve to the legacy
+    ``~/.dsync/state.json`` to keep the default profile aligned with
+    existing environments.
+    """
+    if profile is None or profile == "default":
         return STATE_FILE
     return _STATE_DIR / f"state_{profile}.json"
 
