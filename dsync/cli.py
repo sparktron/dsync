@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import difflib
+import io
 import threading
 import time
 import webbrowser
@@ -10,6 +12,7 @@ from pathlib import Path
 
 import click
 from rich.console import Console
+from rich.syntax import Syntax
 from rich.table import Table
 
 from .config import load_config, list_profiles
@@ -80,8 +83,9 @@ def pull(ctx: click.Context) -> None:
 
 @cli.command()
 @click.argument("path", required=False)
+@click.option("--diff", "show_diff", is_flag=True, help="Show file diffs before pushing.")
 @click.pass_context
-def push(ctx: click.Context, path: str | None) -> None:
+def push(ctx: click.Context, path: str | None, show_diff: bool) -> None:
     """
     Push local changes to the server.
 
@@ -102,7 +106,7 @@ def push(ctx: click.Context, path: str | None) -> None:
             _push_path(ssh, config, state, path)
             append_log("push", [path], ok=True, duration_ms=int((time.monotonic() - t0) * 1000), profile=profile)
         else:
-            transferred = _push_all_interactive(ssh, config, state)
+            transferred = _push_all_interactive(ssh, config, state, show_diff=show_diff)
             append_log("push", transferred, ok=True, duration_ms=int((time.monotonic() - t0) * 1000), profile=profile)
     run_hook(config, "post_push")
 
@@ -143,9 +147,9 @@ def _push_path(
 
 
 def _push_all_interactive(
-    ssh: SSHManager, config, state: StateManager
+    ssh: SSHManager, config, state: StateManager, show_diff: bool = False
 ) -> list[str]:
-    """Full push: diff → confirm → backup → sync. Returns list of transferred files."""
+    """Full push: diff → [show diff] → confirm → backup → sync. Returns transferred files."""
     console.print("[blue]ℹ[/] Computing changes...")
     changed = rsync_push_dry_run(config)
 
@@ -156,6 +160,9 @@ def _push_all_interactive(
     console.print(f"\n[bold]Files to push[/] ({len(changed)}):")
     for f in changed:
         console.print(f"  [cyan]{f}[/]")
+
+    if show_diff:
+        _show_push_diffs(ssh, config, changed)
 
     if not click.confirm(f"\nPush {len(changed)} file(s)?", default=True):
         return []
@@ -174,6 +181,37 @@ def _push_all_interactive(
         console.print(f"  [green]✓[/] {f} → {url}")
     console.print(f"\n[green]✓[/] {len(transferred)} file(s) pushed.")
     return transferred
+
+
+def _show_push_diffs(ssh: SSHManager, config, changed: list[str]) -> None:
+    """Fetch remote versions and display unified diffs for changed text files."""
+    console.print("\n[bold]Diffs[/] (remote → local):")
+    for rel_path in changed:
+        local_path = config.local_root / rel_path
+        try:
+            local_text = local_path.read_text(errors="replace")
+        except Exception:
+            continue
+        if "\x00" in local_text:
+            console.print(f"\n  [dim]{rel_path} — binary file, skipped[/]")
+            continue
+        try:
+            buf = io.BytesIO()
+            ssh.sftp.getfo(config.remote_root + rel_path, buf)
+            remote_text = buf.getvalue().decode("utf-8", errors="replace")
+        except Exception:
+            remote_text = ""  # new file — show full content as addition
+        diff_lines = list(difflib.unified_diff(
+            remote_text.splitlines(keepends=True),
+            local_text.splitlines(keepends=True),
+            fromfile=f"remote/{rel_path}",
+            tofile=f"local/{rel_path}",
+        ))
+        if not diff_lines:
+            console.print(f"\n  [dim]{rel_path} — no text diff (metadata only)[/]")
+            continue
+        console.print(f"\n[bold dim]{rel_path}[/]")
+        console.print(Syntax("".join(diff_lines), "diff", theme="monokai"))
 
 
 # ---------------------------------------------------------------------------
