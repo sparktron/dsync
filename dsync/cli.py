@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 import webbrowser
 from datetime import datetime
@@ -190,26 +191,52 @@ def watch(ctx: click.Context) -> None:
     ssh = SSHManager(config)
     ssh.connect()
 
+    MAX_RETRIES = 3
     failures: list[str] = []
+    _retry_state: dict[str, dict] = {}
 
-    def on_change(rel_path: str) -> None:
-        timestamp = datetime.now().strftime("%H:%M:%S")
+    def _attempt_upload(rel_path: str) -> None:
         local_path = config.local_root / rel_path
         if not local_path.exists():
             return
         t0 = time.monotonic()
         success = push_single_file(ssh, config, state, rel_path)
         duration_ms = int((time.monotonic() - t0) * 1000)
+        timestamp = datetime.now().strftime("%H:%M:%S")
         if success:
+            _retry_state.pop(rel_path, None)
             url = file_to_url(config, rel_path)
-            console.print(
-                f"[dim][{timestamp}][/] [green]✓[/] pushed {rel_path} → {url}"
-            )
+            console.print(f"[dim][{timestamp}][/] [green]✓[/] pushed {rel_path} → {url}")
             append_log("watch_push", [rel_path], ok=True, duration_ms=duration_ms, profile=profile)
         else:
-            console.print(f"[dim][{timestamp}][/] [red]✗[/] failed  {rel_path}")
-            failures.append(rel_path)
-            append_log("watch_push", [rel_path], ok=False, duration_ms=duration_ms, profile=profile)
+            entry = _retry_state.get(rel_path, {"count": 0})
+            count = entry["count"] + 1
+            if count < MAX_RETRIES:
+                delay = 2 ** count  # 2s, 4s
+                console.print(
+                    f"[dim][{timestamp}][/] [yellow]⚠[/] failed {rel_path} "
+                    f"(retry {count}/{MAX_RETRIES - 1} in {delay}s)"
+                )
+                timer = threading.Timer(delay, _attempt_upload, args=[rel_path])
+                _retry_state[rel_path] = {"count": count, "timer": timer}
+                timer.start()
+            else:
+                console.print(
+                    f"[dim][{timestamp}][/] [red]✗[/] gave up on {rel_path} "
+                    f"after {MAX_RETRIES} attempts"
+                )
+                failures.append(rel_path)
+                _retry_state.pop(rel_path, None)
+                append_log("watch_push", [rel_path], ok=False, duration_ms=duration_ms, profile=profile)
+
+    def on_change(rel_path: str) -> None:
+        # Cancel any pending retry before attempting a fresh upload.
+        existing = _retry_state.pop(rel_path, None)
+        if existing:
+            timer = existing.get("timer")
+            if timer:
+                timer.cancel()
+        _attempt_upload(rel_path)
 
     watcher = FileWatcher(config, on_change)
     try:
