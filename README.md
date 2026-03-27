@@ -24,7 +24,11 @@ No build step. No framework. Just files.
   - [`dsync status`](#dsync-status)
   - [`dsync backup`](#dsync-backup)
   - [`dsync open`](#dsync-open-path)
+  - [`dsync log`](#dsync-log)
+  - [`dsync profiles`](#dsync-profiles)
 - [Config reference](#-config-reference)
+- [Hooks](#-hooks)
+- [Multiple profiles](#-multiple-profiles)
 - [How SSH auth works](#-how-ssh-auth-works)
 - [State file](#-state-file)
 - [Development](#-development)
@@ -132,9 +136,31 @@ Push 2 file(s)? [Y/n]:
 ```
 dsync push css/custom.css
 ℹ Backing up remote file...
-✓ Uploading css/custom.css
 ✓ Done — https://example.com/css/custom.css
 ```
+
+**`--diff`** — show a colorized diff (remote → local) before the confirm prompt:
+
+```
+dsync push --diff
+ℹ Computing changes...
+
+Files to push (1):
+  css/custom.css
+
+Diffs (remote → local):
+
+css/custom.css
+--- remote/css/custom.css
++++ local/css/custom.css
+@@ -12,6 +12,7 @@
+   color: #333;
++  font-weight: bold;
+
+Push 1 file(s)? [Y/n]:
+```
+
+Binary files are skipped automatically. New files show their full content as an addition.
 
 ---
 
@@ -151,7 +177,7 @@ Watching ~/projects/mysite/ — Ctrl+C to stop
 Stopped.
 ```
 
-Saves are debounced 800 ms to avoid duplicate uploads on rapid writes.
+Saves are debounced 800 ms to avoid duplicate uploads on rapid writes. If an upload fails, dsync retries automatically up to **3 times** with exponential backoff (2 s, then 4 s). If a file is saved again while a retry is pending, the retry is cancelled and a fresh upload starts immediately.
 
 ---
 
@@ -173,6 +199,23 @@ dsync status
 ```
 
 Groups: **local newer**, **remote newer**, **local only**, **remote only**.
+
+**`--local`** — instant offline check against the last sync state (no SSH connection):
+
+```
+dsync status --local
+   Local Status (vs last sync)
+┌──────────────┬──────────────────────┐
+│ Status       │ File                 │
+├──────────────┼──────────────────────┤
+│ modified     │ css/custom.css       │
+│ new          │ blog/post-3.html     │
+└──────────────┴──────────────────────┘
+
+Local check only — run dsync status to compare with remote.
+```
+
+Useful on large sites where the full rsync dry-run is slow.
 
 ---
 
@@ -203,6 +246,47 @@ With no argument, opens the site root.
 
 ---
 
+### `dsync log`
+
+Show recent sync operation history:
+
+```
+dsync log
+                          Sync Log
+┌─────────────────────┬────────────┬───────┬──────────┬────────┬─────────┐
+│ Time                │ Action     │ Files │ Duration │ Status │ Profile │
+├─────────────────────┼────────────┼───────┼──────────┼────────┼─────────┤
+│ 2024-01-15T14:33:00 │ backup     │     0 │ 8.2s     │ ok     │ default │
+│ 2024-01-15T14:32:05 │ push       │     2 │ 1.4s     │ ok     │ default │
+│ 2024-01-15T14:31:50 │ pull       │     0 │ 2.1s     │ ok     │ default │
+└─────────────────────┴────────────┴───────┴──────────┴────────┴─────────┘
+```
+
+Use `-n` to control how many entries to show (default: 20):
+
+```
+dsync log -n 50
+```
+
+The log is stored at `~/.dsync/sync.log` (capped at 500 entries).
+
+---
+
+### `dsync profiles`
+
+List all available configuration profiles:
+
+```
+dsync profiles
+Available profiles:
+  default
+  staging
+
+Use dsync --profile NAME <command> to target a specific profile.
+```
+
+---
+
 ## ⚙️ Config reference
 
 `~/.dsync/config.json`:
@@ -228,8 +312,68 @@ With no argument, opens the site root.
     "*.swp",
     "__pycache__/",
     ".dsync_state"
-  ]
+  ],
+  "hooks": {
+    "pre_push": "",
+    "post_push": "",
+    "pre_pull": "",
+    "post_pull": ""
+  }
 }
+```
+
+---
+
+## 🪝 Hooks
+
+Hooks let you run shell commands automatically before or after a push or pull. They run in your `local_root` directory.
+
+| Hook | When it runs |
+|------|-------------|
+| `pre_push` | Before uploading files to the server |
+| `post_push` | After a successful upload |
+| `pre_pull` | Before downloading files from the server |
+| `post_pull` | After a successful download |
+
+**A failing pre-hook aborts the operation.** Post-hooks only run if files were actually transferred.
+
+Example — compile Sass before pushing, then bust the CDN cache after:
+
+```json
+{
+  "hooks": {
+    "pre_push": "sass src/styles.scss css/styles.css",
+    "post_push": "curl -s -X POST https://example.com/cdn/purge"
+  }
+}
+```
+
+---
+
+## 👤 Multiple profiles
+
+Manage multiple sites from one installation using named profiles. Each profile has its own config and sync state.
+
+**Create a new profile** — run any command with `--profile NAME` and the wizard launches automatically if no config exists for that profile yet:
+
+```
+dsync --profile staging pull
+```
+
+Named profile configs are stored at `~/.dsync/profiles/<name>.json`. The default profile continues to use `~/.dsync/config.json`.
+
+**Use a profile for any command:**
+
+```bash
+dsync --profile staging push
+dsync --profile staging status --local
+dsync -p staging watch
+```
+
+**List all profiles:**
+
+```
+dsync profiles
 ```
 
 ---
@@ -252,9 +396,12 @@ The temporary agent is torn down when the process exits.
 
 ## 🗂️ State file
 
-After each push/pull, dsync writes `~/.dsync/state.json` — a manifest of
-every synced file's mtime, MD5 checksum, and sync timestamp. This enables
-fast local diffing without rescanning the server.
+After each push/pull, dsync writes a state manifest — a record of every synced file's mtime, MD5 checksum, and sync timestamp. This enables fast local diffing without rescanning the server.
+
+| Profile | State file |
+|---------|-----------|
+| default | `~/.dsync/state.json` |
+| `staging` | `~/.dsync/state_staging.json` |
 
 ---
 
