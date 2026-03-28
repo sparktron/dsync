@@ -108,8 +108,13 @@ Push 2 file(s)? [Y/n]:
 ```
 dsync push css/custom.260105063601.css
 ℹ Backing up remote file...
-✓ Uploading css/custom.260105063601.css
 ✓ Done — https://dylansparks.com/css/custom.260105063601.css
+```
+
+**`--diff`** — show a colorized diff of every changed file (remote → local) before the confirm prompt:
+
+```
+dsync push --diff
 ```
 
 ---
@@ -128,6 +133,7 @@ Stopped.
 ```
 
 Saves are debounced 800 ms to avoid duplicate uploads on rapid writes.
+Failed uploads retry automatically up to 3 times with exponential backoff (2 s, 4 s).
 
 ---
 
@@ -149,6 +155,14 @@ dsync status
 ```
 
 Groups: **local newer**, **remote newer**, **local only**, **remote only**.
+
+**`--local`** — instant offline check against the last sync state (no network):
+
+```
+dsync status --local
+```
+
+Reports **modified**, **new**, and **deleted** files relative to the last push/pull.
 
 ---
 
@@ -179,6 +193,81 @@ With no argument, opens the site root.
 
 ---
 
+### `dsync log`
+
+Show recent sync operation history:
+
+```
+dsync log
+                        Sync Log
+┌─────────────────────┬────────────┬───────┬──────────┬────────┬─────────┐
+│ Time                │ Action     │ Files │ Duration │ Status │ Profile │
+├─────────────────────┼────────────┼───────┼──────────┼────────┼─────────┤
+│ 2024-01-15T14:32:01 │ push       │     2 │ 1.2s     │ ok     │ default │
+│ 2024-01-15T14:30:00 │ pull       │     0 │ 800ms    │ ok     │ default │
+└─────────────────────┴────────────┴───────┴──────────┴────────┴─────────┘
+```
+
+Use `-n` to control how many entries to show (default: 20). Log is stored at
+`~/.dsync/sync.log`.
+
+---
+
+### `dsync profiles`
+
+List available configuration profiles:
+
+```
+dsync profiles
+Available profiles:
+  default
+  staging
+```
+
+Use `dsync --profile NAME <command>` to target a specific profile.
+
+---
+
+## Multi-profile support
+
+Run dsync against multiple sites from one installation. Named profiles store
+config at `~/.dsync/profiles/<name>.json` with a separate state file per
+profile. The default profile continues to use `~/.dsync/config.json`.
+
+```bash
+# First use of a new profile triggers the wizard
+dsync --profile staging pull
+
+# All commands support --profile / -p
+dsync -p staging push
+dsync -p staging status --local
+```
+
+---
+
+## Hooks
+
+Run shell commands automatically before or after push/pull. Add a `"hooks"`
+section to your config:
+
+```json
+{
+  "hooks": {
+    "pre_push":  "npm run build",
+    "post_push": "curl -X POST https://dylansparks.com/purge-cache",
+    "pre_pull":  "",
+    "post_pull": ""
+  }
+}
+```
+
+- A failing `pre_push` / `pre_pull` (non-zero exit) **aborts** the operation.
+- `post_push` / `post_pull` only run after a successful sync.
+- Hooks run in your `local_root` directory.
+- Omit a key (or leave it blank) to skip that hook.
+
+---
+
 ## Config reference
 
 `~/.dsync/config.json`:
@@ -204,7 +293,13 @@ With no argument, opens the site root.
     "*.swp",
     "__pycache__/",
     ".dsync_state"
-  ]
+  ],
+  "hooks": {
+    "pre_push": "",
+    "post_push": "",
+    "pre_pull": "",
+    "post_pull": ""
+  }
 }
 ```
 
@@ -228,6 +323,11 @@ The temporary agent is torn down when the process exits.
 
 ## State file
 
-After each push/pull, dsync writes `~/.dsync/state.json` — a manifest of
-every synced file's mtime, MD5 checksum, and sync timestamp. This enables
-fast local diffing without rescanning the server.
+After each push/pull, dsync writes a state manifest (mtime, MD5 checksum,
+and sync timestamp for every tracked file). This enables fast local diffing
+without rescanning the server.
+
+| Profile | State file |
+|---------|-----------|
+| default | `~/.dsync/state.json` |
+| named   | `~/.dsync/state_<name>.json` |
