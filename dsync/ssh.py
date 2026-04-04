@@ -44,10 +44,14 @@ def get_passphrase(force_new: bool = False) -> Optional[str]:
     return _passphrase_cache
 
 
-def get_rsync_env(key_path: Path) -> dict[str, str]:
+def get_rsync_env(key_path: Path, config: Optional[Config] = None) -> dict[str, str]:
     """
     Return an environment dict that has the SSH key loaded into an agent,
     suitable for passing to rsync subprocess calls.
+
+    Args:
+        key_path: Path to the SSH private key file
+        config: Optional Config object to use stored passphrase if available
 
     Reuses an already-running agent if the key is already loaded;
     otherwise starts a fresh ssh-agent and adds the key via SSH_ASKPASS.
@@ -73,7 +77,11 @@ def get_rsync_env(key_path: Path) -> dict[str, str]:
                 return dict(os.environ)
 
     # Start a fresh ssh-agent.
-    passphrase = get_passphrase()
+    # Use stored passphrase from config if available, otherwise prompt
+    if config and config.passphrase is not None:
+        passphrase = config.passphrase
+    else:
+        passphrase = get_passphrase()
     agent_result = subprocess.run(["ssh-agent", "-s"], capture_output=True, text=True)
     new_env: dict[str, str] = {}
     for line in agent_result.stdout.splitlines():

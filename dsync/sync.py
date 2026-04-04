@@ -59,7 +59,7 @@ def _run_rsync(
         + _exclude_flags(config.ignore_patterns)
         + [src, dst]
     )
-    env = get_rsync_env(config.key_path)
+    env = get_rsync_env(config.key_path, config=config)
     return subprocess.run(
         cmd,
         capture_output=capture,
