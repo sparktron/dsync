@@ -11,11 +11,12 @@ import time
 from pathlib import Path
 from typing import Optional
 
+import click
 import paramiko
 from rich.console import Console
 from rich.prompt import Prompt
 
-from .config import Config
+from .config import Config, save_config
 
 console = Console()
 
@@ -24,11 +25,22 @@ _passphrase_cache: Optional[str] = None
 _agent_env: dict[str, str] = {}
 
 
-def get_passphrase() -> str:
-    """Prompt for the SSH key passphrase once, caching it for the session."""
+def get_passphrase(force_new: bool = False) -> Optional[str]:
+    """Prompt for the SSH key passphrase, caching it for the session.
+
+    Args:
+        force_new: If True, discard cache and prompt again (e.g., after auth failure)
+
+    Returns None if the user provides no passphrase (empty input).
+    """
     global _passphrase_cache
+    if force_new:
+        _passphrase_cache = None
     if _passphrase_cache is None:
-        _passphrase_cache = Prompt.ask("[yellow]SSH key passphrase[/]", password=True)
+        prompt_text = "[yellow]SSH key passphrase[/] (press Enter if no passphrase)"
+        user_input = Prompt.ask(prompt_text, password=True, default="")
+        # Convert empty string to None (no passphrase)
+        _passphrase_cache = user_input if user_input else None
     return _passphrase_cache
 
 
@@ -113,17 +125,19 @@ class SSHManager:
     Reconnects automatically if the transport drops.
     """
 
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, profile: Optional[str] = None) -> None:
         self.config = config
+        self.profile = profile
         self._client: Optional[paramiko.SSHClient] = None
         self._sftp: Optional[paramiko.SFTPClient] = None
+        self._connection_succeeded = False
 
     # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
 
     def connect(self, retry: bool = True) -> None:
-        """Establish SSH connection, retrying once on failure."""
+        """Establish SSH connection, with smart retry logic for auth failures."""
         console.print(
             f"[blue]ℹ[/] Connecting to "
             f"[bold]{self.config.host}:{self.config.port}[/]..."
@@ -131,14 +145,14 @@ class SSHManager:
         try:
             self._do_connect()
             console.print("[green]✓[/] Connected")
+            self._connection_succeeded = True
+            self._offer_to_save_passphrase()
+        except paramiko.ssh_exception.AuthenticationException as exc:
+            self._handle_auth_failure(exc, retry=retry)
+        except (ValueError, paramiko.ssh_exception.SSHException) as exc:
+            self._handle_key_error(exc, retry=retry)
         except Exception as exc:
-            if retry:
-                console.print(f"[red]✗[/] Connection failed: {exc}. Retrying in 3 s...")
-                time.sleep(3)
-                self._do_connect()
-                console.print("[green]✓[/] Connected")
-            else:
-                raise
+            self._handle_generic_error(exc, retry=retry)
 
     def run(self, command: str, check: bool = True) -> tuple[str, str]:
         """
@@ -209,7 +223,115 @@ class SSHManager:
 
     def _do_connect(self) -> None:
         """Perform the actual paramiko connection."""
-        passphrase = get_passphrase()
+        # Use stored passphrase if available, otherwise prompt
+        if self.config.passphrase is not None:
+            passphrase = self.config.passphrase
+        else:
+            passphrase = get_passphrase()
+
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(
+            hostname=self.config.host,
+            port=self.config.port,
+            username=self.config.user,
+            key_filename=str(self.config.key_path),
+            passphrase=passphrase,
+            timeout=30,
+        )
+        self._client = client
+        self._sftp = None  # opened lazily
+
+    def _offer_to_save_passphrase(self) -> None:
+        """Offer to save the passphrase to config for future use."""
+        # Only offer if we successfully connected and don't already have a saved passphrase
+        if not self._connection_succeeded or self.config.passphrase is not None:
+            return
+
+        passphrase = _passphrase_cache
+        if passphrase is None:
+            return
+
+        response = Prompt.ask(
+            "[yellow]Save SSH passphrase to config for future use?[/] (yes/no)",
+            choices=["yes", "no"],
+            default="no"
+        )
+        if response == "yes":
+            self.config.passphrase = passphrase
+            save_config(self.config, profile=self.profile)
+            console.print("[green]✓[/] Passphrase saved to config")
+        else:
+            console.print("[dim]Passphrase not saved[/]")
+
+    def _handle_auth_failure(self, exc: Exception, retry: bool = True) -> None:
+        """Handle authentication failures (wrong passphrase or key rejection)."""
+        console.print(f"[red]✗[/] Authentication failed: {exc}")
+        if not retry:
+            raise exc
+
+        # Clear the cached passphrase so user can try again
+        console.print("[yellow]The passphrase or key may be incorrect.[/]")
+        if click.confirm("Retry with a different passphrase?", default=True):
+            time.sleep(1)
+            try:
+                self._do_connect_with_new_passphrase()
+                console.print("[green]✓[/] Connected")
+                self._connection_succeeded = True
+                self._offer_to_save_passphrase()
+            except Exception as e:
+                console.print(f"[red]✗[/] Connection still failed: {e}")
+                raise
+        else:
+            raise exc
+
+    def _handle_key_error(self, exc: Exception, retry: bool = True) -> None:
+        """Handle key loading errors (invalid key format, wrong passphrase for key)."""
+        error_msg = str(exc).lower()
+        if "password" in error_msg or "passphrase" in error_msg or "salt" in error_msg:
+            console.print("[red]✗[/] Wrong passphrase or encrypted key issue")
+            if retry:
+                console.print("[yellow]The passphrase appears to be incorrect.[/]")
+                if click.confirm("Retry with a different passphrase?", default=True):
+                    time.sleep(1)
+                    try:
+                        self._do_connect_with_new_passphrase()
+                        console.print("[green]✓[/] Connected")
+                        self._connection_succeeded = True
+                        self._offer_to_save_passphrase()
+                    except Exception as e:
+                        console.print(f"[red]✗[/] Connection still failed: {e}")
+                        raise
+                else:
+                    raise exc
+            else:
+                raise exc
+        else:
+            console.print(f"[red]✗[/] Key error: {exc}")
+            raise exc
+
+    def _handle_generic_error(self, exc: Exception, retry: bool = True) -> None:
+        """Handle network and other connection errors."""
+        console.print(f"[red]✗[/] Connection failed: {exc}")
+        if retry:
+            console.print("[yellow]Retrying in 3 seconds...[/]")
+            time.sleep(3)
+            try:
+                self._do_connect()
+                console.print("[green]✓[/] Connected")
+                self._connection_succeeded = True
+                self._offer_to_save_passphrase()
+            except Exception as e:
+                console.print(f"[red]✗[/] Retry failed: {e}")
+                raise
+        else:
+            raise exc
+
+    def _do_connect_with_new_passphrase(self) -> None:
+        """Connect with a fresh passphrase prompt, clearing the cache."""
+        # Force a new passphrase prompt
+        passphrase = get_passphrase(force_new=True)
+
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         client.connect(
