@@ -72,7 +72,7 @@ def pull(ctx: click.Context) -> None:
         return
 
     t0 = time.monotonic()
-    with SSHManager(config) as ssh:  # noqa: F841  (establishes connection + verifies auth)
+    with SSHManager(config, profile=profile) as ssh:  # noqa: F841  (establishes connection + verifies auth)
         rsync_pull(config, state)
     append_log(
         "pull",
@@ -112,7 +112,7 @@ def push(ctx: click.Context, path: str | None, show_diff: bool) -> None:
 
     t0 = time.monotonic()
     deployed = False
-    with SSHManager(config) as ssh:
+    with SSHManager(config, profile=profile) as ssh:
         if path:
             deployed = _push_path(ssh, config, state, path)
             append_log(
@@ -253,7 +253,7 @@ def watch(ctx: click.Context) -> None:
     profile = ctx.obj["profile"]
     config = load_config(profile=profile)
     state = StateManager(profile=profile)
-    ssh = SSHManager(config)
+    ssh = SSHManager(config, profile=profile)
     ssh.connect()
 
     MAX_RETRIES = 3
@@ -449,7 +449,7 @@ def backup(ctx: click.Context) -> None:
     profile = ctx.obj["profile"]
     config = load_config(profile=profile)
     t0 = time.monotonic()
-    with SSHManager(config) as ssh:
+    with SSHManager(config, profile=profile) as ssh:
         backup_path = create_full_backup(ssh, config)
         console.print(f"[green]✓[/] Backup created: {backup_path}")
     append_log(
