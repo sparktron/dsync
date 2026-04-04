@@ -43,10 +43,11 @@ class Config:
         self.backup_dir: str = data.get("backup_dir", "~/backups/dsync")
         self.ignore_patterns: list[str] = data.get("ignore_patterns", DEFAULT_IGNORE)
         self.hooks: dict[str, str] = data.get("hooks", {})
+        self.passphrase: str | None = data.get("passphrase", None)
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize config to a JSON-compatible dict."""
-        return {
+        data = {
             "host": self.host,
             "port": self.port,
             "user": self.user,
@@ -58,6 +59,9 @@ class Config:
             "ignore_patterns": self.ignore_patterns,
             "hooks": self.hooks,
         }
+        if self.passphrase is not None:
+            data["passphrase"] = self.passphrase
+        return data
 
 
 def _config_file(profile: str | None) -> Path:
