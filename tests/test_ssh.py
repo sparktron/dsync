@@ -32,6 +32,7 @@ def ssh_manager(mock_config):
 class TestPassphraseCaching:
     """Test passphrase caching behavior."""
 
+    @patch("dsync.ssh._passphrase_asked", False)
     @patch("dsync.ssh._passphrase_cache", None)
     @patch("dsync.ssh.Prompt.ask")
     def test_passphrase_cached_after_first_prompt(self, mock_prompt):
@@ -48,6 +49,7 @@ class TestPassphraseCaching:
         assert result2 == "mypassphrase"
         assert mock_prompt.call_count == 1  # No additional call
 
+    @patch("dsync.ssh._passphrase_asked", False)
     @patch("dsync.ssh._passphrase_cache", None)
     @patch("dsync.ssh.Prompt.ask")
     def test_empty_passphrase_converted_to_none(self, mock_prompt):
@@ -57,6 +59,7 @@ class TestPassphraseCaching:
         result = get_passphrase()
         assert result is None
 
+    @patch("dsync.ssh._passphrase_asked", False)
     @patch("dsync.ssh._passphrase_cache", None)
     @patch("dsync.ssh.Prompt.ask")
     def test_force_new_passphrase_clears_cache(self, mock_prompt):

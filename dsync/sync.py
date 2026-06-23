@@ -253,13 +253,13 @@ def push_single_file(
 # ---------------------------------------------------------------------------
 
 
-def rsync_status(config: Config) -> dict[str, list[str]]:
+def rsync_status(config: Config, ssh: SSHManager) -> dict[str, list[str]]:
     """
     Compare local and remote, grouping files by sync status.
 
     Returns a dict with keys:
-    - local_newer:  local file differs from / is newer than remote.
-    - remote_newer: remote file differs from / is newer than local.
+    - local_newer:  exists on both sides, differs, local mtime is newer.
+    - remote_newer: exists on both sides, differs, remote mtime is newer.
     - local_only:   exists locally, not on remote.
     - remote_only:  exists on remote, not locally.
     """
@@ -282,17 +282,45 @@ def rsync_status(config: Config) -> dict[str, list[str]]:
         pull_result.stdout if pull_result.returncode == 0 else ""
     )
 
-    push_set = set(push_transfers)
-    pull_set = set(pull_transfers)
+    # A file that exists on both sides with differing content is listed by BOTH
+    # dry-runs (each direction would update the other), so rsync alone can't say
+    # which side is newer. Resolve direction by comparing mtimes.
+    differing = set(push_transfers) & set(pull_transfers)
+    local_newer: list[str] = []
+    remote_newer: list[str] = []
+    for rel in differing:
+        local_mtime = _local_mtime(config, rel)
+        remote_mtime = _remote_mtime(ssh, config, rel)
+        if remote_mtime is not None and remote_mtime > local_mtime:
+            remote_newer.append(rel)
+        else:
+            local_newer.append(rel)
 
     # *deleting in push dry-run = remote has file, local doesn't → remote_only
     # *deleting in pull dry-run = local has file, remote doesn't → local_only
     return {
-        "local_newer": sorted(push_set - pull_set),
-        "remote_newer": sorted(pull_set - push_set),
+        "local_newer": sorted(local_newer),
+        "remote_newer": sorted(remote_newer),
         "local_only": sorted(pull_deletions),
         "remote_only": sorted(push_deletions),
     }
+
+
+def _local_mtime(config: Config, rel_path: str) -> float:
+    """Return the local file's mtime, or 0.0 if it can't be read."""
+    try:
+        return (config.local_root / rel_path).stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _remote_mtime(ssh: SSHManager, config: Config, rel_path: str) -> Optional[float]:
+    """Return the remote file's mtime via SFTP, or None if it can't be read."""
+    try:
+        attr = ssh.sftp.stat(config.remote_root + rel_path)
+        return attr.st_mtime
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -300,15 +328,33 @@ def rsync_status(config: Config) -> dict[str, list[str]]:
 # ---------------------------------------------------------------------------
 
 
-def _remote_backup_base(config: Config) -> str:
-    """Expand the remote backup dir to an absolute path."""
-    return config.backup_dir.replace("~", f"/home/{config.user}")
+# Cache of the resolved remote $HOME, keyed by "user@host", to avoid an extra
+# round-trip on every backup call (notably during `watch`).
+_remote_home_cache: dict[str, str] = {}
+
+
+def _remote_backup_base(ssh: SSHManager, config: Config) -> str:
+    """Expand the remote backup dir to an absolute path.
+
+    A leading ``~`` is expanded using the remote account's actual ``$HOME``
+    rather than assuming ``/home/<user>``.
+    """
+    base = config.backup_dir
+    if base == "~" or base.startswith("~/"):
+        cache_key = f"{config.user}@{config.host}"
+        home = _remote_home_cache.get(cache_key)
+        if home is None:
+            out, _ = ssh.run("printf '%s' \"$HOME\"")
+            home = out.strip() or f"/home/{config.user}"
+            _remote_home_cache[cache_key] = home
+        base = home + base[1:]
+    return base
 
 
 def _backup_remote_file(ssh: SSHManager, config: Config, rel_path: str) -> None:
     """Copy a single remote file to the timestamped backup directory."""
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    backup_base = _remote_backup_base(config)
+    backup_base = _remote_backup_base(ssh, config)
     safe_name = rel_path.replace("/", "_")
     backup_path = f"{backup_base}/{timestamp}_{safe_name}"
     remote_file = config.remote_root + rel_path
@@ -327,7 +373,7 @@ def backup_remote_files(ssh: SSHManager, config: Config, rel_paths: list[str]) -
     copies each file there. Returns the backup directory path.
     """
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    backup_base = _remote_backup_base(config)
+    backup_base = _remote_backup_base(ssh, config)
     backup_dir = f"{backup_base}/{timestamp}"
     ssh.run(f"mkdir -p {shlex.quote(backup_dir)}")
     for rel_path in rel_paths:
@@ -349,7 +395,7 @@ def create_full_backup(ssh: SSHManager, config: Config) -> str:
     timestamp in the filename. Returns the remote path of the archive.
     """
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    backup_base = _remote_backup_base(config)
+    backup_base = _remote_backup_base(ssh, config)
     backup_path = f"{backup_base}/{timestamp}.tar.gz"
     ssh.run(f"mkdir -p {shlex.quote(backup_base)}")
     console.print("[blue]ℹ[/] Archiving remote site (this may take a moment)...")

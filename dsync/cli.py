@@ -259,17 +259,24 @@ def watch(ctx: click.Context) -> None:
     MAX_RETRIES = 3
     failures: list[str] = []
     _retry_state: dict[str, dict] = {}
+    # Guards _retry_state and failures (touched from watcher + retry-timer threads).
+    _retry_lock = threading.Lock()
+    # Serializes the actual upload: paramiko's SFTP channel and the StateManager
+    # are not thread-safe, and retry timers can fire concurrently with new events.
+    _upload_lock = threading.Lock()
 
     def _attempt_upload(rel_path: str) -> None:
         local_path = config.local_root / rel_path
         if not local_path.exists():
             return
         t0 = time.monotonic()
-        success = push_single_file(ssh, config, state, rel_path)
+        with _upload_lock:
+            success = push_single_file(ssh, config, state, rel_path)
         duration_ms = int((time.monotonic() - t0) * 1000)
         timestamp = datetime.now().strftime("%H:%M:%S")
         if success:
-            _retry_state.pop(rel_path, None)
+            with _retry_lock:
+                _retry_state.pop(rel_path, None)
             url = file_to_url(config, rel_path)
             console.print(
                 f"[dim][{timestamp}][/] [green]✓[/] pushed {rel_path} → {url}"
@@ -282,24 +289,28 @@ def watch(ctx: click.Context) -> None:
                 profile=profile,
             )
         else:
-            entry = _retry_state.get(rel_path, {"count": 0})
-            count = entry["count"] + 1
-            if count < MAX_RETRIES:
-                delay = 2**count  # 2s, 4s
+            with _retry_lock:
+                entry = _retry_state.get(rel_path, {"count": 0})
+                count = entry["count"] + 1
+                retrying = count < MAX_RETRIES
+                if retrying:
+                    delay = 2**count  # 2s, 4s
+                    timer = threading.Timer(delay, _attempt_upload, args=[rel_path])
+                    _retry_state[rel_path] = {"count": count, "timer": timer}
+                else:
+                    _retry_state.pop(rel_path, None)
+                    failures.append(rel_path)
+            if retrying:
                 console.print(
                     f"[dim][{timestamp}][/] [yellow]⚠[/] failed {rel_path} "
                     f"(retry {count}/{MAX_RETRIES - 1} in {delay}s)"
                 )
-                timer = threading.Timer(delay, _attempt_upload, args=[rel_path])
-                _retry_state[rel_path] = {"count": count, "timer": timer}
                 timer.start()
             else:
                 console.print(
                     f"[dim][{timestamp}][/] [red]✗[/] gave up on {rel_path} "
                     f"after {MAX_RETRIES} attempts"
                 )
-                failures.append(rel_path)
-                _retry_state.pop(rel_path, None)
                 append_log(
                     "watch_push",
                     [rel_path],
@@ -310,7 +321,8 @@ def watch(ctx: click.Context) -> None:
 
     def on_change(rel_path: str) -> None:
         # Cancel any pending retry before attempting a fresh upload.
-        existing = _retry_state.pop(rel_path, None)
+        with _retry_lock:
+            existing = _retry_state.pop(rel_path, None)
         if existing:
             timer = existing.get("timer")
             if timer:
@@ -322,11 +334,13 @@ def watch(ctx: click.Context) -> None:
         watcher.run()
     finally:
         # Cancel any pending retry timers before closing the SSH connection.
-        for entry in list(_retry_state.values()):
+        with _retry_lock:
+            pending = list(_retry_state.values())
+            _retry_state.clear()
+        for entry in pending:
             t = entry.get("timer")
             if t:
                 t.cancel()
-        _retry_state.clear()
         ssh.close()
         if failures:
             console.print(
@@ -359,7 +373,8 @@ def status(ctx: click.Context, local_only: bool) -> None:
 
     console.print("[blue]ℹ[/] Comparing local vs remote (this may take a moment)...")
 
-    groups = rsync_status(config)
+    with SSHManager(config, profile=profile) as ssh:
+        groups = rsync_status(config, ssh)
 
     total = sum(len(v) for v in groups.values())
     if total == 0:

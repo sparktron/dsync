@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fnmatch
 import threading
 import time
 from pathlib import Path
@@ -13,33 +12,9 @@ from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
 from .config import Config
+from .state import _matches_ignore
 
 console = Console()
-
-# Patterns excluded from watch events (in addition to config ignore_patterns).
-_WATCH_IGNORE: list[str] = [
-    ".git",
-    "images",
-    "lscache",
-    "__pycache__",
-    ".DS_Store",
-    "*~",
-    "*.swp",
-    ".dsync_state",
-    "*.gz",
-    "*.zip",
-]
-
-
-def _should_ignore(abs_path: str) -> bool:
-    """Return True if this path should be excluded from watch events."""
-    parts = Path(abs_path).parts
-    name = Path(abs_path).name
-    for part in (*parts, name):
-        for pattern in _WATCH_IGNORE:
-            if fnmatch.fnmatch(part, pattern):
-                return True
-    return False
 
 
 class _DebouncedHandler(FileSystemEventHandler):
@@ -55,11 +30,13 @@ class _DebouncedHandler(FileSystemEventHandler):
         self,
         root: Path,
         callback: Callable[[str], None],
+        ignore_patterns: list[str],
         debounce_ms: int = 800,
     ) -> None:
         super().__init__()
         self.root = root
         self.callback = callback
+        self.ignore_patterns = ignore_patterns
         self.debounce_ms = debounce_ms
         self._timers: dict[str, threading.Timer] = {}
         self._lock = threading.Lock()
@@ -74,11 +51,12 @@ class _DebouncedHandler(FileSystemEventHandler):
 
     def _schedule(self, abs_path: str) -> None:
         """Cancel any pending timer for this file and start a fresh one."""
-        if _should_ignore(abs_path):
-            return
         try:
             rel_path = str(Path(abs_path).relative_to(self.root))
         except ValueError:
+            return
+
+        if _matches_ignore(rel_path, self.ignore_patterns):
             return
 
         with self._lock:
@@ -124,6 +102,7 @@ class FileWatcher:
         handler = _DebouncedHandler(
             root=self.config.local_root,
             callback=self.callback,
+            ignore_patterns=self.config.ignore_patterns,
             debounce_ms=self.debounce_ms,
         )
         observer = Observer()

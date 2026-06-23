@@ -22,6 +22,7 @@ console = Console()
 
 # Module-level caches (per process / session)
 _passphrase_cache: Optional[str] = None
+_passphrase_asked: bool = False
 _agent_env: dict[str, str] = {}
 
 
@@ -31,16 +32,19 @@ def get_passphrase(force_new: bool = False) -> Optional[str]:
     Args:
         force_new: If True, discard cache and prompt again (e.g., after auth failure)
 
-    Returns None if the user provides no passphrase (empty input).
+    Returns None if the user provides no passphrase (empty input). A ``None``
+    result is cached too, so an unencrypted key only prompts once per session.
     """
-    global _passphrase_cache
+    global _passphrase_cache, _passphrase_asked
     if force_new:
+        _passphrase_asked = False
         _passphrase_cache = None
-    if _passphrase_cache is None:
+    if not _passphrase_asked:
         prompt_text = "[yellow]SSH key passphrase[/] (press Enter if no passphrase)"
         user_input = Prompt.ask(prompt_text, password=True, default="")
         # Convert empty string to None (no passphrase)
         _passphrase_cache = user_input if user_input else None
+        _passphrase_asked = True
     return _passphrase_cache
 
 
@@ -93,33 +97,42 @@ def get_rsync_env(key_path: Path, config: Optional[Config] = None) -> dict[str, 
         # ssh-agent not available; rsync will fall back to interactive prompting.
         return dict(os.environ)
 
-    # Write a temporary askpass script that echoes the passphrase.
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".sh", delete=False, prefix="dsync_askpass_"
-    ) as f:
-        f.write(f"#!/bin/sh\nprintf '%s' {shlex.quote(passphrase)}\n")
-        askpass_path = f.name
-    os.chmod(askpass_path, 0o700)
+    if passphrase:
+        # Write a temporary askpass script that feeds the passphrase to ssh-add.
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".sh", delete=False, prefix="dsync_askpass_"
+        ) as f:
+            f.write(f"#!/bin/sh\nprintf '%s' {shlex.quote(passphrase)}\n")
+            askpass_path = f.name
+        os.chmod(askpass_path, 0o700)
 
-    try:
-        add_env = {
-            **os.environ,
-            **new_env,
-            "SSH_ASKPASS": askpass_path,
-            "SSH_ASKPASS_REQUIRE": "force",  # OpenSSH ≥ 8.4
-            "DISPLAY": os.environ.get("DISPLAY", ":0"),
-        }
+        try:
+            add_env = {
+                **os.environ,
+                **new_env,
+                "SSH_ASKPASS": askpass_path,
+                "SSH_ASKPASS_REQUIRE": "force",  # OpenSSH ≥ 8.4
+                "DISPLAY": os.environ.get("DISPLAY", ":0"),
+            }
+            subprocess.run(
+                ["ssh-add", str(key_path)],
+                env=add_env,
+                capture_output=True,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            try:
+                os.unlink(askpass_path)
+            except OSError:
+                pass
+    else:
+        # Unencrypted key — no passphrase needed, so skip the askpass dance.
         subprocess.run(
             ["ssh-add", str(key_path)],
-            env=add_env,
+            env={**os.environ, **new_env},
             capture_output=True,
             stdin=subprocess.DEVNULL,
         )
-    finally:
-        try:
-            os.unlink(askpass_path)
-        except OSError:
-            pass
 
     _agent_env = new_env
     return {**os.environ, **_agent_env}
