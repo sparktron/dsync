@@ -366,3 +366,150 @@ def test_missing_rsync_reports_cleanly(config, monkeypatch):
         sync.rsync_push_dry_run(config)
     assert excinfo.value.returncode is None
     assert "not installed or not on PATH" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# Path confinement
+#
+# `lstrip("/")` does not strip `..`, and the ValueError from relative_to() was
+# swallowed with `pass`, so `dsync push ../secrets.env` uploaded a file from
+# outside the project to outside the remote web root with no confirmation.
+#
+# The companion bug: local_root was expanduser()'d but never resolve()'d, while
+# every candidate path was resolve()'d. On a symlinked project root that made
+# relative_to() fail for files that genuinely are in the project — so closing
+# the escape without resolving the root would have rejected valid pushes.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def linked_config(tmp_path):
+    """A config whose local_root is a symlink to the real project directory."""
+    real = tmp_path / "real_site"
+    (real / "css").mkdir(parents=True)
+    (real / "index.html").write_text("<h1>hi</h1>")
+    (real / "css" / "style.css").write_text("body{}")
+    (tmp_path / "secrets.env").write_text("SECRET")
+    link = tmp_path / "site_link"
+    link.symlink_to(real)
+    cfg = Config(
+        {
+            "host": "example.com",
+            "port": 22,
+            "user": "testuser",
+            "key_path": str(tmp_path / "id_rsa"),
+            "local_root": str(link),
+            "remote_root": "/home/testuser/public_html/",
+            "site_url": "https://example.com",
+        }
+    )
+    return cfg, tmp_path, real, link
+
+
+def test_local_root_is_resolved_not_merely_expanded(linked_config):
+    cfg, _tmp, real, link = linked_config
+    assert cfg.local_root == real.resolve()
+    assert cfg.local_root != link
+
+
+@pytest.mark.parametrize(
+    ("given", "expected"),
+    [
+        ("index.html", "index.html"),
+        ("css/style.css", "css/style.css"),
+        ("/index.html", "index.html"),
+    ],
+)
+def test_relative_to_root_accepts_in_project_paths(given, expected, linked_config):
+    cfg, _tmp, _real, _link = linked_config
+    assert sync.relative_to_root(cfg, given) == expected
+
+
+def test_relative_to_root_accepts_paths_through_the_symlinked_root(linked_config):
+    """The BUG-9 regression: an in-project file reached via the symlink."""
+    cfg, _tmp, real, link = linked_config
+    assert sync.relative_to_root(cfg, str(link / "index.html")) == "index.html"
+    assert (
+        sync.relative_to_root(cfg, str(real / "css" / "style.css")) == "css/style.css"
+    )
+
+
+@pytest.mark.parametrize(
+    "escape",
+    [
+        "../secrets.env",
+        "../../../etc/passwd",
+        "/etc/passwd",
+        "css/../../secrets.env",
+    ],
+)
+def test_relative_to_root_refuses_to_escape(escape, linked_config):
+    cfg, _tmp, _real, _link = linked_config
+    with pytest.raises(sync.PathOutsideRoot):
+        sync.relative_to_root(cfg, escape)
+
+
+def test_relative_path_is_read_against_the_root_not_the_cwd(linked_config, monkeypatch):
+    """`dsync push css/style.css` must work from any directory."""
+    cfg, tmp, _real, _link = linked_config
+    elsewhere = tmp / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    assert sync.relative_to_root(cfg, "css/style.css") == "css/style.css"
+
+
+def test_cwd_relative_file_outside_the_root_is_refused(linked_config, monkeypatch):
+    cfg, tmp, _real, _link = linked_config
+    elsewhere = tmp / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "stray.html").write_text("x")
+    monkeypatch.chdir(elsewhere)
+    with pytest.raises(sync.PathOutsideRoot):
+        sync.relative_to_root(cfg, "stray.html")
+
+
+# --- remote side -----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("rel", "expected"),
+    [
+        ("index.html", "/home/testuser/public_html/index.html"),
+        ("css/style.css", "/home/testuser/public_html/css/style.css"),
+        ("", "/home/testuser/public_html"),
+    ],
+)
+def test_remote_path_for_joins_under_the_remote_root(rel, expected, config):
+    assert sync.remote_path_for(config, rel) == expected
+
+
+@pytest.mark.parametrize("escape", ["../secrets.env", "../../etc/passwd", "a/../../b"])
+def test_remote_path_for_refuses_to_escape(escape, config):
+    with pytest.raises(sync.PathOutsideRoot):
+        sync.remote_path_for(config, escape)
+
+
+def test_push_single_file_refuses_an_escaping_relative_path(config, tmp_path):
+    """Defense in depth: even if a bad rel_path reaches sync, nothing is written."""
+    outside = config.local_root.parent / "secrets.env"
+    outside.write_text("SECRET")
+    ssh = MagicMock()
+    with pytest.raises(sync.PathOutsideRoot):
+        sync.push_single_file(ssh, config, MagicMock(), "../secrets.env")
+    ssh.sftp.put.assert_not_called()
+    ssh.run.assert_not_called()
+
+
+def test_leading_slash_is_read_as_a_site_path(linked_config):
+    """`dsync open /aboutme/index.html` means the site root, not the filesystem."""
+    cfg, _tmp, real, _link = linked_config
+    (real / "aboutme").mkdir()
+    (real / "aboutme" / "index.html").write_text("<h1>about</h1>")
+    assert sync.relative_to_root(cfg, "/aboutme/index.html") == "aboutme/index.html"
+
+
+def test_absolute_path_to_a_real_file_outside_the_root_is_refused(linked_config):
+    """An absolute path that exists elsewhere means that file, not a site path."""
+    cfg, tmp, _real, _link = linked_config
+    with pytest.raises(sync.PathOutsideRoot):
+        sync.relative_to_root(cfg, str(tmp / "secrets.env"))

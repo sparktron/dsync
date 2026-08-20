@@ -223,3 +223,44 @@ def test_unreachable_host_on_status_exits_nonzero(runner, config):
     assert result.exit_code != 0
     assert "in sync" not in result.output
     assert "Traceback" not in result.output
+
+
+# ---------------------------------------------------------------------------
+# Path confinement at the CLI boundary
+# ---------------------------------------------------------------------------
+
+
+def test_push_of_an_escaping_path_fails_without_uploading(runner, env, config):
+    (config.local_root.parent / "secrets.env").write_text("SECRET")
+    with patch("dsync.cli.push_single_file") as upload:
+        result = runner.invoke(cli, ["push", "../secrets.env"])
+
+    assert result.exit_code != 0
+    upload.assert_not_called()
+    assert "outside the project root" in result.output
+    ((_args, kwargs),) = _log_calls(env)
+    assert kwargs["ok"] is False
+
+
+def test_open_of_an_escaping_path_is_refused(runner, config):
+    with (
+        patch("dsync.cli.load_config", return_value=config),
+        patch("dsync.cli.webbrowser.open") as browser,
+    ):
+        result = runner.invoke(cli, ["open", "../../../etc/passwd"])
+
+    assert result.exit_code != 0
+    browser.assert_not_called()
+
+
+def test_open_builds_the_url_for_an_in_project_path(runner, config):
+    (config.local_root / "css").mkdir()
+    (config.local_root / "css" / "style.css").write_text("body{}")
+    with (
+        patch("dsync.cli.load_config", return_value=config),
+        patch("dsync.cli.webbrowser.open") as browser,
+    ):
+        result = runner.invoke(cli, ["open", "css/style.css"])
+
+    assert result.exit_code == 0
+    browser.assert_called_once_with("https://example.com/css/style.css")

@@ -6,9 +6,10 @@ reproduced in a local checkout rather than inferred from reading.
 
 **Tally:** 5 critical · 4 high · 6 medium · 7 low
 
-> **Status:** CI-1, TEST-1, BUG-1 and BUG-5 are fixed on this branch, along with
-> the `rsync_pull` dead-deletion reporting listed under Low. 17 findings remain
-> open; BUG-2/BUG-9 are the recommended next pair.
+> **Status:** CI-1, TEST-1, BUG-1, BUG-5, BUG-2 and BUG-9 are fixed on this
+> branch, along with the `rsync_pull` dead-deletion reporting listed under Low.
+> 15 findings remain open. Next is the credential group (SEC-2, SEC-3, BUG-4),
+> which needs a decision on whether to keep passphrase storage at all.
 
 The tool's shape is sound — clean module split, idiomatic rsync wrapping, and the recent
 SSH error-handling work is good. Problems cluster in three places: nobody is watching CI,
@@ -99,7 +100,7 @@ For a tool whose job is reporting whether the live site matches your working cop
 
 **Fix:** raise on non-zero (allowing 23/24 explicitly if wanted), surface stderr, exit non-zero.
 
-### BUG-2 — `dsync push ../file` writes outside the remote web root
+### BUG-2 — `dsync push ../file` writes outside the remote web root — FIXED
 `dsync/cli.py:139-151`, `dsync/sync.py:224`
 
 `_push_path` does `rel_path = path.lstrip("/")`, which strips leading slashes but not `..`.
@@ -252,7 +253,7 @@ remote `find -printf` or a batched listing.
 `os.sep`-joined paths on Windows, and `remote_root + rel_path` in `push_single_file` has the
 same problem — force POSIX separators where a local path becomes a remote path or URL.
 
-### BUG-9 — `local_root` is expanded but never resolved
+### BUG-9 — `local_root` is expanded but never resolved — FIXED
 `dsync/config.py:40`, `dsync/cli.py:144-149`, `dsync/cli.py:495-500`
 
 `Config.local_root` is `Path(...).expanduser()` with no `.resolve()`, but `_push_path` and
@@ -288,8 +289,9 @@ confusing "Path not found" for a file that plainly exists.
 3. ~~**Fix the two lies.**~~ Done — `RsyncError` raised at every rsync call site, connection
    failures reported cleanly instead of as tracebacks, and the log now distinguishes
    "nothing to do" from "failed". *(BUG-1, BUG-5)*
-4. **Confine paths to the roots.** Turn the silent `except ValueError: pass` into a hard error
-   and normalise the remote side. *(BUG-2, BUG-9)*
+4. ~~**Confine paths to the roots.**~~ Done — `relative_to_root` and `remote_path_for`
+   centralise the policy, `local_root` is resolved, and the target is validated before
+   any connection is opened. *(BUG-2, BUG-9)*
 5. **Close the credential gaps.** Config to `0600`, agent lifetime bounded, `ssh-add` failures
    surfaced. *(SEC-2, SEC-3, BUG-4)*
 6. **Restore host key verification.** Last, because it needs a first-run trust flow designed

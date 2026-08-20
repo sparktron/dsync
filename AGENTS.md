@@ -61,6 +61,13 @@ This tool writes to a live public website over SSH. Treat every change to
 - rsync `--delete` semantics are destructive on the remote. Never widen the
   delete scope or change exclude patterns without saying so explicitly.
 - Never log credentials, key material, or full SSH URIs with embedded auth.
+- Every local path from a user goes through `relative_to_root`, and every remote
+  path through `remote_path_for`. Both refuse to leave their configured root.
+  Never rebuild a remote path with `config.remote_root + rel_path` — `lstrip("/")`
+  does not strip `..`, which is how `push ../x` used to write outside the web root.
+- `Config.local_root` is `.resolve()`d. Path comparisons elsewhere come from
+  `Path.resolve()`, so leaving the root unresolved breaks `relative_to()` for
+  files that genuinely are in the project whenever the root contains a symlink.
 - Dry-run paths must stay genuinely side-effect-free. If you add a code path
   that writes, confirm it is gated behind the non-dry-run branch.
 

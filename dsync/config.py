@@ -37,7 +37,10 @@ class Config:
         self.port: int = int(data["port"])
         self.user: str = data["user"]
         self.key_path: Path = Path(data["key_path"]).expanduser()
-        self.local_root: Path = Path(data["local_root"]).expanduser()
+        # Resolved, not merely expanded: every path comparison in the tool comes
+        # from Path.resolve(), so an unresolved root with a symlink component
+        # made relative_to() fail for files that genuinely are in the project.
+        self.local_root: Path = Path(data["local_root"]).expanduser().resolve()
         self.remote_root: str = data["remote_root"].rstrip("/") + "/"
         self.site_url: str = data["site_url"].rstrip("/")
         self.backup_dir: str = data.get("backup_dir", "~/backups/dsync")

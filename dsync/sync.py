@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import posixpath
 import shlex
 import subprocess
 from datetime import datetime
@@ -32,6 +33,78 @@ class RsyncError(RuntimeError):
         code = f" (rsync exit {returncode})" if returncode is not None else ""
         detail = f"\n{self.stderr}" if self.stderr else ""
         super().__init__(f"{action} failed{code}{detail}")
+
+
+class PathOutsideRoot(ValueError):
+    """A path resolved outside the configured local or remote root."""
+
+
+# ---------------------------------------------------------------------------
+# Path confinement
+#
+# Everything dsync writes must land under remote_root, and everything it reads
+# must come from under local_root. `lstrip("/")` does not strip `..`, so without
+# these a mistyped `dsync push ../secrets.env` uploaded a file from outside the
+# project to outside the web root, with no confirmation.
+# ---------------------------------------------------------------------------
+
+
+def _within(path: Path, root: Path) -> bool:
+    """True if *path* is *root* or sits underneath it."""
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def relative_to_root(config: Config, path: str) -> str:
+    """Resolve a user-supplied path to a POSIX path relative to local_root.
+
+    Accepts an absolute filesystem path, a path relative to local_root, a path
+    relative to the current directory, or a leading-slash site path such as
+    ``/aboutme/index.html``. Raises PathOutsideRoot if the result would fall
+    outside local_root.
+    """
+    root = config.local_root
+    candidate = Path(path).expanduser()
+
+    if candidate.is_absolute():
+        resolved = candidate.resolve()
+        if not _within(resolved, root) and not resolved.exists():
+            # A leading slash can also mean "relative to the site root", the way
+            # a URL path does: `dsync open /aboutme/index.html`. Only fall back
+            # to that reading when no such file exists on disk — if it does, the
+            # user meant that file, and it belongs to a different project.
+            resolved = (root / candidate.relative_to(candidate.anchor)).resolve()
+    else:
+        # Read against local_root first, so `dsync push css/style.css` works from
+        # any directory; fall back to a cwd-relative reading only if that is the
+        # one that exists.
+        from_root = (root / candidate).resolve()
+        from_cwd = (Path.cwd() / candidate).resolve()
+        resolved = from_root
+        if not from_root.exists() and from_cwd.exists():
+            resolved = from_cwd
+
+    if not _within(resolved, root):
+        raise PathOutsideRoot(
+            f"{path!r} resolves to {resolved}, which is outside the project root {root}"
+        )
+
+    rel = resolved.relative_to(root)
+    return "" if rel == Path(".") else rel.as_posix()
+
+
+def remote_path_for(config: Config, rel_path: str) -> str:
+    """Join a root-relative path onto remote_root, refusing to escape it."""
+    root = config.remote_root  # normalised by Config to end in "/"
+    joined = posixpath.normpath(root + rel_path)
+    if joined != root.rstrip("/") and not joined.startswith(root):
+        raise PathOutsideRoot(
+            f"{rel_path!r} resolves to {joined}, which is outside the remote root {root}"
+        )
+    return joined
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +297,7 @@ def rsync_push_directory(
     Returns the list of files transferred.
     """
     local_src = str(config.local_root / rel_dir) + "/"
-    remote_dst = f"{config.user}@{config.host}:{config.remote_root}{rel_dir}/"
+    remote_dst = f"{config.user}@{config.host}:{remote_path_for(config, rel_dir)}/"
     result = _run_rsync(config, local_src, remote_dst)
     _check_rsync(result, f"Push of {rel_dir}/")
     transfers, _ = _parse_itemize(result.stdout)
@@ -257,7 +330,7 @@ def push_single_file(
         console.print(f"[red]✗[/] Local file not found: {local_path}")
         return False
 
-    remote_path = config.remote_root + rel_path
+    remote_path = remote_path_for(config, rel_path)
 
     # Backup the existing remote file.
     try:
@@ -354,7 +427,7 @@ def _local_mtime(config: Config, rel_path: str) -> float:
 def _remote_mtime(ssh: SSHManager, config: Config, rel_path: str) -> float | None:
     """Return the remote file's mtime via SFTP, or None if it can't be read."""
     try:
-        attr = ssh.sftp.stat(config.remote_root + rel_path)
+        attr = ssh.sftp.stat(remote_path_for(config, rel_path))
         return attr.st_mtime
     except Exception:
         return None
@@ -394,7 +467,7 @@ def _backup_remote_file(ssh: SSHManager, config: Config, rel_path: str) -> None:
     backup_base = _remote_backup_base(ssh, config)
     safe_name = rel_path.replace("/", "_")
     backup_path = f"{backup_base}/{timestamp}_{safe_name}"
-    remote_file = config.remote_root + rel_path
+    remote_file = remote_path_for(config, rel_path)
     ssh.run(f"mkdir -p {shlex.quote(backup_base)}")
     ssh.run(
         f"cp {shlex.quote(remote_file)} {shlex.quote(backup_path)} 2>/dev/null || true",
@@ -414,7 +487,7 @@ def backup_remote_files(ssh: SSHManager, config: Config, rel_paths: list[str]) -
     backup_dir = f"{backup_base}/{timestamp}"
     ssh.run(f"mkdir -p {shlex.quote(backup_dir)}")
     for rel_path in rel_paths:
-        remote_file = config.remote_root + rel_path
+        remote_file = remote_path_for(config, rel_path)
         safe_name = rel_path.replace("/", "_")
         dest = f"{backup_dir}/{safe_name}"
         ssh.run(

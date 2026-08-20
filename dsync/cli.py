@@ -8,7 +8,6 @@ import threading
 import time
 import webbrowser
 from datetime import datetime
-from pathlib import Path
 
 import click
 import paramiko
@@ -21,11 +20,14 @@ from .log import append_log, read_log
 from .ssh import SSHManager
 from .state import StateManager, _matches_ignore
 from .sync import (
+    PathOutsideRoot,
     RsyncError,
     backup_remote_files,
     create_full_backup,
     file_to_url,
     push_single_file,
+    relative_to_root,
+    remote_path_for,
     rsync_pull,
     rsync_push_all,
     rsync_push_directory,
@@ -42,7 +44,7 @@ console = Console()
 # came up at all — an unreachable host is the common case in practice. Both mean
 # "this did not run", and both should report cleanly and exit non-zero rather
 # than surfacing a paramiko traceback with no log entry.
-OPERATION_ERRORS = (RsyncError, paramiko.SSHException, OSError)
+OPERATION_ERRORS = (RsyncError, PathOutsideRoot, paramiko.SSHException, OSError)
 
 
 def _ms(t0: float) -> int:
@@ -126,9 +128,12 @@ def push(ctx: click.Context, path: str | None, show_diff: bool) -> None:
 
     t0 = time.monotonic()
     try:
+        # Resolve and confine the target before opening a connection, so a bad
+        # path fails immediately rather than after an SSH handshake.
+        rel_path = relative_to_root(config, path) if path is not None else None
         with SSHManager(config, profile=profile) as ssh:
-            if path:
-                result = _push_path(ssh, config, state, path)
+            if rel_path is not None:
+                result = _push_path(ssh, config, state, rel_path)
             else:
                 result = _push_all_interactive(ssh, config, state, show_diff=show_diff)
                 if result is None:
@@ -153,23 +158,13 @@ def push(ctx: click.Context, path: str | None, show_diff: bool) -> None:
 
 
 def _push_path(
-    ssh: SSHManager, config, state: StateManager, path: str
+    ssh: SSHManager, config, state: StateManager, rel_path: str
 ) -> list[str] | None:
-    """Push a file or directory.
+    """Push a file or directory named by a root-relative path.
 
     Returns the relative paths transferred, or None if the push failed.
     An empty list means the target was already up to date.
     """
-    rel_path = path.lstrip("/")
-
-    # Allow both absolute local paths and paths relative to local_root.
-    abs_path = Path(path).expanduser().resolve()
-    if abs_path.exists():
-        try:
-            rel_path = str(abs_path.relative_to(config.local_root))
-        except ValueError:
-            pass  # not under local_root, use as-is
-
     local_path = config.local_root / rel_path
     if not local_path.exists():
         console.print(f"[red]✗[/] Path not found: {local_path}")
@@ -247,7 +242,7 @@ def _show_push_diffs(ssh: SSHManager, config, changed: list[str]) -> None:
             continue
         try:
             buf = io.BytesIO()
-            ssh.sftp.getfo(config.remote_root + rel_path, buf)
+            ssh.sftp.getfo(remote_path_for(config, rel_path), buf)
             remote_text = buf.getvalue().decode("utf-8", errors="replace")
         except Exception:
             remote_text = ""  # new file — show full content as addition
@@ -519,14 +514,11 @@ def open_url(ctx: click.Context, path: str | None) -> None:
     config = load_config(profile=profile)
 
     if path:
-        rel_path = path.lstrip("/")
-        # Allow absolute paths under local_root.
-        abs_path = Path(path).expanduser().resolve()
-        if abs_path.exists():
-            try:
-                rel_path = str(abs_path.relative_to(config.local_root))
-            except ValueError:
-                pass
+        try:
+            rel_path = relative_to_root(config, path)
+        except PathOutsideRoot as exc:
+            console.print(f"[red]✗[/] {exc}")
+            raise SystemExit(1) from exc
         url = file_to_url(config, rel_path)
     else:
         url = config.site_url
