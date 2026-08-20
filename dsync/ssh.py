@@ -47,6 +47,19 @@ def get_passphrase(force_new: bool = False) -> str | None:
     return _passphrase_cache
 
 
+def _run_tool(cmd: list[str], **kwargs) -> subprocess.CompletedProcess[str] | None:
+    """Run an ssh helper binary, returning None if it is not installed.
+
+    ssh-agent, ssh-add and ssh-keygen are not guaranteed to be present. Letting
+    a missing binary raise FileNotFoundError turns every push into a traceback;
+    degrading to the caller's own environment lets ssh prompt instead.
+    """
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, **kwargs)
+    except FileNotFoundError:
+        return None
+
+
 def get_rsync_env(key_path: Path, config: Config | None = None) -> dict[str, str]:
     """
     Return an environment dict that has the SSH key loaded into an agent,
@@ -67,13 +80,9 @@ def get_rsync_env(key_path: Path, config: Config | None = None) -> dict[str, str
 
     # If the user already has an agent running with the key loaded, use it.
     if "SSH_AUTH_SOCK" in os.environ:
-        listed = subprocess.run(["ssh-add", "-l"], capture_output=True, text=True)
-        keygen = subprocess.run(
-            ["ssh-keygen", "-l", "-f", str(key_path)],
-            capture_output=True,
-            text=True,
-        )
-        if listed.returncode == 0 and keygen.returncode == 0:
+        listed = _run_tool(["ssh-add", "-l"])
+        keygen = _run_tool(["ssh-keygen", "-l", "-f", str(key_path)])
+        if listed and keygen and listed.returncode == 0 and keygen.returncode == 0:
             fp = keygen.stdout.split()[1] if keygen.stdout.strip() else ""
             if fp and fp in listed.stdout:
                 _agent_env = {"SSH_AUTH_SOCK": os.environ["SSH_AUTH_SOCK"]}
@@ -85,15 +94,19 @@ def get_rsync_env(key_path: Path, config: Config | None = None) -> dict[str, str
         passphrase = config.passphrase
     else:
         passphrase = get_passphrase()
-    agent_result = subprocess.run(["ssh-agent", "-s"], capture_output=True, text=True)
+    agent_result = _run_tool(["ssh-agent", "-s"])
     new_env: dict[str, str] = {}
-    for line in agent_result.stdout.splitlines():
-        m = re.match(r"(\w+)=([^;]+);", line)
-        if m:
-            new_env[m.group(1)] = m.group(2)
+    if agent_result is not None:
+        for line in agent_result.stdout.splitlines():
+            m = re.match(r"(\w+)=([^;]+);", line)
+            if m:
+                new_env[m.group(1)] = m.group(2)
 
     if not new_env:
-        # ssh-agent not available; rsync will fall back to interactive prompting.
+        # ssh-agent missing or unusable; rsync falls back to interactive prompting.
+        console.print(
+            "[yellow]⚠[/] ssh-agent unavailable — ssh may prompt for the key passphrase."
+        )
         return dict(os.environ)
 
     if passphrase:
@@ -113,10 +126,9 @@ def get_rsync_env(key_path: Path, config: Config | None = None) -> dict[str, str
                 "SSH_ASKPASS_REQUIRE": "force",  # OpenSSH ≥ 8.4
                 "DISPLAY": os.environ.get("DISPLAY", ":0"),
             }
-            subprocess.run(
+            _run_tool(
                 ["ssh-add", str(key_path)],
                 env=add_env,
-                capture_output=True,
                 stdin=subprocess.DEVNULL,
             )
         finally:
@@ -126,10 +138,9 @@ def get_rsync_env(key_path: Path, config: Config | None = None) -> dict[str, str
                 pass
     else:
         # Unencrypted key — no passphrase needed, so skip the askpass dance.
-        subprocess.run(
+        _run_tool(
             ["ssh-add", str(key_path)],
             env={**os.environ, **new_env},
-            capture_output=True,
             stdin=subprocess.DEVNULL,
         )
 

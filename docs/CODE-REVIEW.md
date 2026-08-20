@@ -6,8 +6,9 @@ reproduced in a local checkout rather than inferred from reading.
 
 **Tally:** 5 critical · 4 high · 6 medium · 7 low
 
-> **Status:** CI-1 and TEST-1 are fixed — see the "ci: restore a green build"
-> commit on this branch. The remaining 20 findings are open.
+> **Status:** CI-1, TEST-1, BUG-1 and BUG-5 are fixed on this branch, along with
+> the `rsync_pull` dead-deletion reporting listed under Low. 17 findings remain
+> open; BUG-2/BUG-9 are the recommended next pair.
 
 The tool's shape is sound — clean module split, idiomatic rsync wrapping, and the recent
 SSH error-handling work is good. Problems cluster in three places: nobody is watching CI,
@@ -79,7 +80,7 @@ Reproduced: file mode `0o644`, directory mode `0o755`, containing
 repair permissions on load. **Better:** stop storing it — hand it to the ssh-agent once per
 session (machinery exists in `get_rsync_env`) or use the system keyring.
 
-### BUG-1 — `dsync status` reports "Everything is in sync" when the comparison failed
+### BUG-1 — `dsync status` reports "Everything is in sync" when the comparison failed — FIXED
 `dsync/sync.py:278-283`
 
 ```python
@@ -189,7 +190,7 @@ are pure and cheap to cover.
 
 ## Medium
 
-### BUG-5 — The operation log records the wrong outcome in both directions
+### BUG-5 — The operation log records the wrong outcome in both directions — FIXED
 `dsync/cli.py:77-83`, `dsync/cli.py:126-134`
 
 *Pull always logs success.* `rsync_pull` prints an error and returns `None` on rsync failure —
@@ -284,8 +285,9 @@ confusing "Path not found" for a file that plainly exists.
    explicit `select` list in `pyproject.toml`. *(CI-1)*
 2. ~~**Add the test job and the `--dry-run` argv tests.**~~ Done — `tests/test_sync.py`,
    plus a Test job across the 3.9–3.12 matrix. *(TEST-1)*
-3. **Fix the two lies.** `rsync_status` must fail loudly; the log must record what happened.
-   Both small, both restore trust in the tool's output. *(BUG-1, BUG-5)*
+3. ~~**Fix the two lies.**~~ Done — `RsyncError` raised at every rsync call site, connection
+   failures reported cleanly instead of as tracebacks, and the log now distinguishes
+   "nothing to do" from "failed". *(BUG-1, BUG-5)*
 4. **Confine paths to the roots.** Turn the silent `except ValueError: pass` into a hard error
    and normalise the remote side. *(BUG-2, BUG-9)*
 5. **Close the credential gaps.** Config to `0600`, agent lifetime bounded, `ssh-add` failures

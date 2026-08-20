@@ -277,3 +277,92 @@ def test_matches_ignore_unanchored_patterns(rel_path, expected):
 
 def test_matches_ignore_with_no_patterns():
     assert _matches_ignore("anything/at/all.html", []) is False
+
+
+# ---------------------------------------------------------------------------
+# Failure propagation
+#
+# The regression these guard: `rsync_status` used to substitute "" for a failed
+# probe's output, so a network or auth failure produced four empty lists and the
+# CLI printed "Everything is in sync." A false in-sync is indistinguishable from
+# a real one, which is the worst outcome available to a deploy tool.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def failing_rsync(monkeypatch):
+    """Make every rsync invocation fail with a chosen exit code."""
+
+    def install(returncode: int, stderr: str = "ssh: connect: no route to host"):
+        def fake_run(cmd, *args, **kwargs):
+            return subprocess.CompletedProcess(
+                cmd, returncode=returncode, stdout="", stderr=stderr
+            )
+
+        monkeypatch.setattr(sync.subprocess, "run", fake_run)
+        monkeypatch.setattr(sync, "get_rsync_env", lambda *a, **k: {})
+
+    return install
+
+
+@pytest.mark.parametrize(("name", "driver"), ALL_DRIVERS)
+def test_hard_failure_raises_instead_of_returning_empty(
+    name, driver, config, failing_rsync
+):
+    failing_rsync(255)
+    with pytest.raises(sync.RsyncError):
+        driver(config)
+
+
+def test_status_never_reports_empty_groups_on_failure(config, failing_rsync):
+    """The specific shape of the old bug: failure must not look like a clean tree."""
+    failing_rsync(255)
+    with pytest.raises(sync.RsyncError):
+        sync.rsync_status(config, MagicMock())
+
+
+def test_rsync_error_carries_exit_code_and_stderr(config, failing_rsync):
+    failing_rsync(255, stderr="Permission denied (publickey).")
+    with pytest.raises(sync.RsyncError) as excinfo:
+        sync.rsync_push_dry_run(config)
+    err = excinfo.value
+    assert err.returncode == 255
+    assert "Permission denied (publickey)." in err.stderr
+    assert "255" in str(err)
+
+
+@pytest.mark.parametrize("code", [23, 24])
+def test_partial_transfer_codes_are_tolerated(code, config, monkeypatch):
+    """23/24 still produce usable output, so status stays available."""
+
+    def fake_run(cmd, *args, **kwargs):
+        return subprocess.CompletedProcess(
+            cmd, returncode=code, stdout=">f+++++++++ index.html\n", stderr="vanished"
+        )
+
+    monkeypatch.setattr(sync.subprocess, "run", fake_run)
+    monkeypatch.setattr(sync, "get_rsync_env", lambda *a, **k: {})
+
+    assert sync.rsync_push_dry_run(config) == ["index.html"]
+
+
+def test_check_rsync_returns_partial_flag():
+    ok = subprocess.CompletedProcess([], returncode=0, stdout="", stderr="")
+    partial = subprocess.CompletedProcess([], returncode=24, stdout="", stderr="")
+    assert sync._check_rsync(ok, "probe") is False
+    assert sync._check_rsync(partial, "probe") is True
+
+
+def test_missing_rsync_reports_cleanly(config, monkeypatch):
+    """A missing rsync binary must not surface as a raw FileNotFoundError."""
+
+    def boom(*args, **kwargs):
+        raise FileNotFoundError(2, "No such file or directory", "rsync")
+
+    monkeypatch.setattr(sync.subprocess, "run", boom)
+    monkeypatch.setattr(sync, "get_rsync_env", lambda *a, **k: {})
+
+    with pytest.raises(sync.RsyncError) as excinfo:
+        sync.rsync_push_dry_run(config)
+    assert excinfo.value.returncode is None
+    assert "not installed or not on PATH" in str(excinfo.value)

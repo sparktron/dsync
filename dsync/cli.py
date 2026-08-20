@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 import click
+import paramiko
 from rich.console import Console
 from rich.syntax import Syntax
 from rich.table import Table
@@ -20,6 +21,7 @@ from .log import append_log, read_log
 from .ssh import SSHManager
 from .state import StateManager, _matches_ignore
 from .sync import (
+    RsyncError,
     backup_remote_files,
     create_full_backup,
     file_to_url,
@@ -34,6 +36,18 @@ from .sync import (
 from .watcher import FileWatcher
 
 console = Console()
+
+
+# An operation can fail because rsync failed, or because the SSH connection never
+# came up at all — an unreachable host is the common case in practice. Both mean
+# "this did not run", and both should report cleanly and exit non-zero rather
+# than surfacing a paramiko traceback with no log entry.
+OPERATION_ERRORS = (RsyncError, paramiko.SSHException, OSError)
+
+
+def _ms(t0: float) -> int:
+    """Elapsed milliseconds since a time.monotonic() reading."""
+    return int((time.monotonic() - t0) * 1000)
 
 
 @click.group()
@@ -72,15 +86,15 @@ def pull(ctx: click.Context) -> None:
         return
 
     t0 = time.monotonic()
-    with SSHManager(config, profile=profile) as ssh:  # noqa: F841  (establishes connection + verifies auth)
-        rsync_pull(config, state)
-    append_log(
-        "pull",
-        [],
-        ok=True,
-        duration_ms=int((time.monotonic() - t0) * 1000),
-        profile=profile,
-    )
+    try:
+        with SSHManager(config, profile=profile) as ssh:  # noqa: F841  (establishes connection + verifies auth)
+            rsync_pull(config, state)
+    except OPERATION_ERRORS as exc:
+        console.print(f"[red]✗[/] Pull failed: {exc}")
+        append_log("pull", [], ok=False, duration_ms=_ms(t0), profile=profile)
+        raise SystemExit(1) from exc
+
+    append_log("pull", [], ok=True, duration_ms=_ms(t0), profile=profile)
     run_hook(config, "post_pull")
 
 
@@ -111,33 +125,41 @@ def push(ctx: click.Context, path: str | None, show_diff: bool) -> None:
         return
 
     t0 = time.monotonic()
-    deployed = False
-    with SSHManager(config, profile=profile) as ssh:
-        if path:
-            deployed = _push_path(ssh, config, state, path)
-            append_log(
-                "push",
-                [path],
-                ok=deployed,
-                duration_ms=int((time.monotonic() - t0) * 1000),
-                profile=profile,
-            )
-        else:
-            transferred = _push_all_interactive(ssh, config, state, show_diff=show_diff)
-            deployed = len(transferred) > 0
-            append_log(
-                "push",
-                transferred,
-                ok=deployed,
-                duration_ms=int((time.monotonic() - t0) * 1000),
-                profile=profile,
-            )
-    if deployed:
+    try:
+        with SSHManager(config, profile=profile) as ssh:
+            if path:
+                result = _push_path(ssh, config, state, path)
+            else:
+                result = _push_all_interactive(ssh, config, state, show_diff=show_diff)
+                if result is None:
+                    # Declined at the confirmation prompt — nothing was attempted,
+                    # so there is nothing to record.
+                    return
+    except OPERATION_ERRORS as exc:
+        console.print(f"[red]✗[/] Push failed: {exc}")
+        append_log("push", [], ok=False, duration_ms=_ms(t0), profile=profile)
+        raise SystemExit(1) from exc
+
+    # An empty list means the tree was already in sync — a success with no work,
+    # not a failure. Only `None` (an upload that failed) is an unsuccessful push.
+    ok = result is not None
+    transferred = result or []
+    append_log("push", transferred, ok=ok, duration_ms=_ms(t0), profile=profile)
+
+    if transferred:
         run_hook(config, "post_push")
+    if not ok:
+        raise SystemExit(1)
 
 
-def _push_path(ssh: SSHManager, config, state: StateManager, path: str) -> bool:
-    """Push a specific file or directory. Returns True if files were deployed."""
+def _push_path(
+    ssh: SSHManager, config, state: StateManager, path: str
+) -> list[str] | None:
+    """Push a file or directory.
+
+    Returns the relative paths transferred, or None if the push failed.
+    An empty list means the target was already up to date.
+    """
     rel_path = path.lstrip("/")
 
     # Allow both absolute local paths and paths relative to local_root.
@@ -151,15 +173,15 @@ def _push_path(ssh: SSHManager, config, state: StateManager, path: str) -> bool:
     local_path = config.local_root / rel_path
     if not local_path.exists():
         console.print(f"[red]✗[/] Path not found: {local_path}")
-        return False
+        return None
 
     if local_path.is_file():
         console.print("[blue]ℹ[/] Backing up remote file...")
-        success = push_single_file(ssh, config, state, rel_path)
-        if success:
-            url = file_to_url(config, rel_path)
-            console.print(f"[green]✓[/] Done — {url}")
-        return success
+        if not push_single_file(ssh, config, state, rel_path):
+            return None
+        url = file_to_url(config, rel_path)
+        console.print(f"[green]✓[/] Done — {url}")
+        return [rel_path]
     else:
         # Directory — use rsync for the subtree.
         console.print(f"[blue]ℹ[/] Pushing directory: {rel_path}/")
@@ -168,13 +190,16 @@ def _push_path(ssh: SSHManager, config, state: StateManager, path: str) -> bool:
             url = file_to_url(config, f)
             console.print(f"  [green]✓[/] {f} → {url}")
         console.print(f"\n[green]✓[/] {len(transferred)} file(s) pushed.")
-        return len(transferred) > 0
+        return transferred
 
 
 def _push_all_interactive(
     ssh: SSHManager, config, state: StateManager, show_diff: bool = False
-) -> list[str]:
-    """Full push: diff → [show diff] → confirm → backup → sync. Returns transferred files."""
+) -> list[str] | None:
+    """Full push: diff → [show diff] → confirm → backup → sync.
+
+    Returns the transferred files, or None if the user declined at the prompt.
+    """
     console.print("[blue]ℹ[/] Computing changes...")
     changed = rsync_push_dry_run(config)
 
@@ -190,7 +215,7 @@ def _push_all_interactive(
         _show_push_diffs(ssh, config, changed)
 
     if not click.confirm(f"\nPush {len(changed)} file(s)?", default=True):
-        return []
+        return None
 
     console.print("[blue]ℹ[/] Creating server backup of changed files...")
     try:
@@ -373,8 +398,12 @@ def status(ctx: click.Context, local_only: bool) -> None:
 
     console.print("[blue]ℹ[/] Comparing local vs remote (this may take a moment)...")
 
-    with SSHManager(config, profile=profile) as ssh:
-        groups = rsync_status(config, ssh)
+    try:
+        with SSHManager(config, profile=profile) as ssh:
+            groups = rsync_status(config, ssh)
+    except OPERATION_ERRORS as exc:
+        console.print(f"[red]✗[/] Status failed: {exc}")
+        raise SystemExit(1) from exc
 
     total = sum(len(v) for v in groups.values())
     if total == 0:

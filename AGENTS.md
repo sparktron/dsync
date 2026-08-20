@@ -66,7 +66,8 @@ This tool writes to a live public website over SSH. Treat every change to
 
 ## Testing
 
-`tests/test_ssh.py` covers connection and passphrase error handling.
+`tests/test_ssh.py` covers connection and passphrase error handling, including
+degrading gracefully when ssh-agent is not installed.
 `tests/test_sync.py` covers the rsync layer at the argv level — it asserts that
 `--delete` never ships without `--dry-run`, that the transferring entry points
 (`rsync_pull`, `rsync_push_all`, `rsync_push_directory`) never pass `--delete`
@@ -76,6 +77,15 @@ Those argv assertions are the guard on the most dangerous code in the repo.
 If you change `_run_rsync` or any of its callers, expect them to fire — and
 treat a failure as a real finding, not a test to update. Add cases rather than
 relaxing them.
+
+`tests/test_cli.py` covers how failures are reported: a failed comparison must
+never print "everything is in sync", and the operation log must record what
+actually happened rather than inferring success from a file count.
+
+Every rsync result must go through `_check_rsync`, which raises `RsyncError`
+on a hard failure and tolerates the partial-transfer codes (23, 24). Never
+substitute empty output for a failed run — that is what made a broken `status`
+indistinguishable from a clean tree.
 
 Still uncovered: `config.py`, `state.py`, `log.py`, `watcher.py`, and the
 non-rsync half of `sync.py` (the SFTP and backup helpers).

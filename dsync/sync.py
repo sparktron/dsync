@@ -18,6 +18,23 @@ console = Console()
 
 
 # ---------------------------------------------------------------------------
+# Errors
+# ---------------------------------------------------------------------------
+
+
+class RsyncError(RuntimeError):
+    """An rsync invocation failed hard enough that its output means nothing."""
+
+    def __init__(self, action: str, returncode: int | None, stderr: str = "") -> None:
+        self.action = action
+        self.returncode = returncode
+        self.stderr = stderr.strip()
+        code = f" (rsync exit {returncode})" if returncode is not None else ""
+        detail = f"\n{self.stderr}" if self.stderr else ""
+        super().__init__(f"{action} failed{code}{detail}")
+
+
+# ---------------------------------------------------------------------------
 # SSH / rsync command helpers
 # ---------------------------------------------------------------------------
 
@@ -59,12 +76,41 @@ def _run_rsync(
         + [src, dst]
     )
     env = get_rsync_env(config.key_path, config=config)
-    return subprocess.run(
-        cmd,
-        capture_output=capture,
-        text=True,
-        env=env,
-    )
+    try:
+        return subprocess.run(
+            cmd,
+            capture_output=capture,
+            text=True,
+            env=env,
+        )
+    except FileNotFoundError as exc:
+        raise RsyncError(
+            "Running rsync", None, "rsync is not installed or not on PATH"
+        ) from exc
+
+
+# rsync still produces usable output when some files could not be transferred
+# (23) or vanished mid-scan (24). Every other non-zero exit means the run tells
+# us nothing — and empty output must never be mistaken for "no differences".
+_RSYNC_PARTIAL_CODES = (23, 24)
+
+
+def _check_rsync(result: subprocess.CompletedProcess[str], action: str) -> bool:
+    """Raise RsyncError unless the run is usable. Returns True if it was partial.
+
+    Callers must route every rsync result through this. Treating a failed run as
+    an empty result is what let `dsync status` report "everything is in sync"
+    when the comparison never actually happened.
+    """
+    if result.returncode == 0:
+        return False
+    if result.returncode in _RSYNC_PARTIAL_CODES:
+        console.print(
+            f"[yellow]⚠[/] {action}: rsync reported a partial run "
+            f"(exit {result.returncode}); results may be incomplete."
+        )
+        return True
+    raise RsyncError(action, result.returncode, result.stderr or "")
 
 
 # ---------------------------------------------------------------------------
@@ -116,16 +162,13 @@ def rsync_pull(config: Config, state: StateManager) -> None:
         progress.add_task("Syncing from server...", total=None)
         result = _run_rsync(config, remote_src, local_dst)
 
-    if result.returncode != 0:
-        console.print(f"[red]✗[/] rsync failed:\n{result.stderr}")
-        return
+    _check_rsync(result, "Pull")
 
-    transfers, deletions = _parse_itemize(result.stdout)
+    # Pull runs without --delete, so rsync never reports deletions here.
+    transfers, _ = _parse_itemize(result.stdout)
     for f in transfers:
         console.print(f"  [green]↓[/] {f}")
-    for f in deletions:
-        console.print(f"  [red]✗[/] deleted locally: {f}")
-    console.print(f"\n[green]✓[/] {len(transfers)} updated, {len(deletions)} deleted")
+    console.print(f"\n[green]✓[/] {len(transfers)} updated")
 
     state.scan_directory(config.local_root, config.ignore_patterns)
     state.save()
@@ -144,9 +187,7 @@ def rsync_push_dry_run(config: Config) -> list[str]:
     local_src = str(config.local_root) + "/"
     remote_dst = f"{config.user}@{config.host}:{config.remote_root}"
     result = _run_rsync(config, local_src, remote_dst, dry_run=True)
-    if result.returncode != 0:
-        console.print(f"[red]✗[/] rsync dry-run failed:\n{result.stderr}")
-        return []
+    _check_rsync(result, "Push dry-run")
     transfers, _ = _parse_itemize(result.stdout)
     return transfers
 
@@ -167,9 +208,7 @@ def rsync_push_all(config: Config, state: StateManager) -> list[str]:
         progress.add_task("Syncing to server...", total=None)
         result = _run_rsync(config, local_src, remote_dst)
 
-    if result.returncode != 0:
-        console.print(f"[red]✗[/] rsync failed:\n{result.stderr}")
-        return []
+    _check_rsync(result, "Push")
 
     transfers, _ = _parse_itemize(result.stdout)
     state.scan_directory(config.local_root, config.ignore_patterns)
@@ -187,9 +226,7 @@ def rsync_push_directory(
     local_src = str(config.local_root / rel_dir) + "/"
     remote_dst = f"{config.user}@{config.host}:{config.remote_root}{rel_dir}/"
     result = _run_rsync(config, local_src, remote_dst)
-    if result.returncode != 0:
-        console.print(f"[red]✗[/] rsync failed:\n{result.stderr}")
-        return []
+    _check_rsync(result, f"Push of {rel_dir}/")
     transfers, _ = _parse_itemize(result.stdout)
     for local_file in (config.local_root / rel_dir).rglob("*"):
         if local_file.is_file():
@@ -274,12 +311,13 @@ def rsync_status(config: Config, ssh: SSHManager) -> dict[str, list[str]]:
         config, remote, local_src, extra_flags=["--delete"], dry_run=True
     )
 
-    push_transfers, push_deletions = _parse_itemize(
-        push_result.stdout if push_result.returncode == 0 else ""
-    )
-    pull_transfers, pull_deletions = _parse_itemize(
-        pull_result.stdout if pull_result.returncode == 0 else ""
-    )
+    # Both probes must have actually run. Substituting empty output for a failed
+    # comparison makes a network or auth failure look identical to a clean tree.
+    _check_rsync(push_result, "Status comparison (local → remote)")
+    _check_rsync(pull_result, "Status comparison (remote → local)")
+
+    push_transfers, push_deletions = _parse_itemize(push_result.stdout)
+    pull_transfers, pull_deletions = _parse_itemize(pull_result.stdout)
 
     # A file that exists on both sides with differing content is listed by BOTH
     # dry-runs (each direction would update the other), so rsync alone can't say

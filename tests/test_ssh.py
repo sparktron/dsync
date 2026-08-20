@@ -388,3 +388,36 @@ class TestErrorMessages:
                     str(call) for call in mock_console.print.call_args_list
                 ]
                 assert any("passphrase" in str(msg).lower() for msg in printed_messages)
+
+
+class TestMissingSSHHelpers:
+    """ssh-agent and friends are not guaranteed to be installed."""
+
+    def test_run_tool_returns_none_when_binary_is_absent(self):
+        from dsync.ssh import _run_tool
+
+        assert _run_tool(["definitely-not-a-real-binary-xyz"]) is None
+
+    def test_run_tool_returns_result_when_binary_exists(self):
+        from dsync.ssh import _run_tool
+
+        result = _run_tool(["echo", "hello"])
+        assert result is not None
+        assert result.stdout.strip() == "hello"
+
+    def test_missing_ssh_agent_degrades_instead_of_raising(self, monkeypatch, tmp_path):
+        """Without ssh-agent, rsync should still run and let ssh prompt."""
+        import dsync.ssh as mod
+
+        monkeypatch.setattr(mod, "_agent_env", {})
+        monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+        monkeypatch.setattr(mod, "_run_tool", lambda *a, **k: None)
+
+        with (
+            patch("dsync.ssh.console"),
+            patch("dsync.ssh.get_passphrase", return_value=None),
+        ):
+            env = mod.get_rsync_env(tmp_path / "id_rsa")
+
+        assert isinstance(env, dict)
+        assert "PATH" in env
