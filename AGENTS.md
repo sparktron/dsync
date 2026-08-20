@@ -18,7 +18,7 @@ locally, sync them up.
 |---|---|
 | `dsync/cli.py` | Click entry point — `dsync = "dsync.cli:cli"` |
 | `dsync/sync.py` | rsync invocation and transfer logic |
-| `dsync/ssh.py` | paramiko/SFTP transport; the only module with tests |
+| `dsync/ssh.py` | paramiko/SFTP transport |
 | `dsync/config.py` | Config loading |
 | `dsync/state.py` | Local sync state tracking |
 | `dsync/watcher.py` | watchdog-based file watching |
@@ -27,21 +27,28 @@ locally, sync them up.
 ## Commands
 
 ```bash
-pip install -e .          # editable install
+pip install -e ".[dev]"   # editable install, with ruff + pytest
 dsync --help              # verify entry point resolves
-ruff check dsync/
-ruff format --check dsync/
-pytest                    # only tests/test_ssh.py exists today
+ruff check dsync/ tests/
+ruff format --check dsync/ tests/
+pytest                    # tests/test_ssh.py, tests/test_sync.py
 ```
 
 ## CI
 
-`.github/workflows/ci.yml` runs two jobs:
+`.github/workflows/ci.yml` runs two jobs, on every branch push and on PRs to
+master:
 
-- **Lint** on Python 3.12 — `ruff check dsync/` and `ruff format --check dsync/`.
-  Format check is enforced, so run `ruff format dsync/` before pushing.
-- **Build & Install** across Python **3.9, 3.10, 3.11, 3.12** — `pip install -e .`
-  then `dsync --help`.
+- **Lint** on Python 3.12 — `ruff check dsync/ tests/` and
+  `ruff format --check dsync/ tests/`. Format check is enforced, so run
+  `ruff format dsync/ tests/` before pushing. Tests are linted too.
+- **Test** across Python **3.9, 3.10, 3.11, 3.12** — `pip install -e ".[dev]"`,
+  then `dsync --help` and `pytest -q`.
+
+Both jobs install via `.[dev]`, so the **ruff version is pinned in
+`pyproject.toml`** and a new ruff release cannot turn the build red on its own.
+Bump it deliberately. The lint rule set is likewise explicit — see
+`[tool.ruff.lint]` — rather than inherited from ruff's shifting defaults.
 
 `requires-python = ">=3.9"`. Do not use 3.10+ syntax (`match`, `X | Y` in
 annotations at runtime, `tomllib`) — the 3.9 matrix leg will fail.
@@ -57,8 +64,18 @@ This tool writes to a live public website over SSH. Treat every change to
 - Dry-run paths must stay genuinely side-effect-free. If you add a code path
   that writes, confirm it is gated behind the non-dry-run branch.
 
-## Testing gap
+## Testing
 
-Only `ssh.py` has coverage. `sync.py` — the module that can delete remote
-files — has none. When touching `sync.py`, add tests rather than relying on
-manual verification against the live host.
+`tests/test_ssh.py` covers connection and passphrase error handling.
+`tests/test_sync.py` covers the rsync layer at the argv level — it asserts that
+`--delete` never ships without `--dry-run`, that the transferring entry points
+(`rsync_pull`, `rsync_push_all`, `rsync_push_directory`) never pass `--delete`
+at all, and that src/dst ordering and excludes are wired correctly.
+
+Those argv assertions are the guard on the most dangerous code in the repo.
+If you change `_run_rsync` or any of its callers, expect them to fire — and
+treat a failure as a real finding, not a test to update. Add cases rather than
+relaxing them.
+
+Still uncovered: `config.py`, `state.py`, `log.py`, `watcher.py`, and the
+non-rsync half of `sync.py` (the SFTP and backup helpers).

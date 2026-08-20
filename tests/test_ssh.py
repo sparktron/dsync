@@ -1,26 +1,28 @@
 """Unit tests for SSH connection and error handling."""
 
-import pytest
-from unittest.mock import Mock, patch, MagicMock
-import paramiko
-from pathlib import Path
+from unittest.mock import MagicMock, patch
 
-from dsync.ssh import SSHManager, get_passphrase, _passphrase_cache
+import paramiko
+import pytest
+
 from dsync.config import Config
+from dsync.ssh import SSHManager, get_passphrase
 
 
 @pytest.fixture
 def mock_config():
     """Create a mock config for testing."""
-    return Config({
-        "host": "example.com",
-        "port": 22,
-        "user": "testuser",
-        "key_path": "~/.ssh/id_rsa",
-        "local_root": "~/project",
-        "remote_root": "/var/www/",
-        "site_url": "https://example.com",
-    })
+    return Config(
+        {
+            "host": "example.com",
+            "port": 22,
+            "user": "testuser",
+            "key_path": "~/.ssh/id_rsa",
+            "local_root": "~/project",
+            "remote_root": "/var/www/",
+            "site_url": "https://example.com",
+        }
+    )
 
 
 @pytest.fixture
@@ -78,7 +80,9 @@ class TestConnectionSuccess:
     """Test successful connection scenarios."""
 
     @patch("paramiko.SSHClient")
-    def test_successful_connection(self, mock_ssh_client_class, ssh_manager, mock_config):
+    def test_successful_connection(
+        self, mock_ssh_client_class, ssh_manager, mock_config
+    ):
         """Test successful SSH connection."""
         mock_client = MagicMock()
         mock_ssh_client_class.return_value = mock_client
@@ -108,7 +112,9 @@ class TestConnectionSuccess:
         assert call_kwargs["passphrase"] is None
 
     @patch("paramiko.SSHClient")
-    def test_uses_stored_passphrase_from_config(self, mock_ssh_client_class, ssh_manager, mock_config):
+    def test_uses_stored_passphrase_from_config(
+        self, mock_ssh_client_class, ssh_manager, mock_config
+    ):
         """Test that stored passphrase in config is used without prompting."""
         mock_client = MagicMock()
         mock_ssh_client_class.return_value = mock_client
@@ -131,7 +137,9 @@ class TestAuthenticationFailure:
 
     @patch("paramiko.SSHClient")
     @patch("click.confirm")
-    def test_auth_failure_prompts_for_retry(self, mock_confirm, mock_ssh_client_class, ssh_manager):
+    def test_auth_failure_prompts_for_retry(
+        self, mock_confirm, mock_ssh_client_class, ssh_manager
+    ):
         """Test that auth failure prompts user to retry."""
         mock_client = MagicMock()
         mock_ssh_client_class.return_value = mock_client
@@ -140,7 +148,7 @@ class TestAuthenticationFailure:
         # First call raises auth error, second call succeeds
         mock_client.connect.side_effect = [
             paramiko.ssh_exception.AuthenticationException("Authentication failed"),
-            None  # Success on second attempt
+            None,  # Success on second attempt
         ]
 
         with patch("dsync.ssh.get_passphrase", return_value="wrongpass"):
@@ -154,12 +162,16 @@ class TestAuthenticationFailure:
 
     @patch("paramiko.SSHClient")
     @patch("click.confirm")
-    def test_auth_failure_no_retry_if_user_declines(self, mock_confirm, mock_ssh_client_class, ssh_manager):
+    def test_auth_failure_no_retry_if_user_declines(
+        self, mock_confirm, mock_ssh_client_class, ssh_manager
+    ):
         """Test that auth failure respects user's choice not to retry."""
         mock_client = MagicMock()
         mock_ssh_client_class.return_value = mock_client
         mock_confirm.return_value = False
-        mock_client.connect.side_effect = paramiko.ssh_exception.AuthenticationException("Authentication failed")
+        mock_client.connect.side_effect = (
+            paramiko.ssh_exception.AuthenticationException("Authentication failed")
+        )
 
         with patch("dsync.ssh.get_passphrase", return_value="wrongpass"):
             with patch("dsync.ssh.console"):
@@ -172,7 +184,9 @@ class TestKeyError:
 
     @patch("paramiko.SSHClient")
     @patch("click.confirm")
-    def test_wrong_passphrase_for_encrypted_key(self, mock_confirm, mock_ssh_client_class, ssh_manager):
+    def test_wrong_passphrase_for_encrypted_key(
+        self, mock_confirm, mock_ssh_client_class, ssh_manager
+    ):
         """Test handling of wrong passphrase for encrypted key."""
         mock_client = MagicMock()
         mock_ssh_client_class.return_value = mock_client
@@ -181,7 +195,7 @@ class TestKeyError:
         # Simulate passphrase validation error
         mock_client.connect.side_effect = [
             ValueError("password and salt must not be empty"),
-            None  # Success on retry
+            None,  # Success on retry
         ]
 
         with patch("dsync.ssh.get_passphrase", return_value="wrongpass"):
@@ -209,7 +223,9 @@ class TestGenericErrors:
 
     @patch("paramiko.SSHClient")
     @patch("time.sleep")
-    def test_network_error_retries_once(self, mock_sleep, mock_ssh_client_class, ssh_manager):
+    def test_network_error_retries_once(
+        self, mock_sleep, mock_ssh_client_class, ssh_manager
+    ):
         """Test that network errors trigger automatic retry."""
         mock_client = MagicMock()
         mock_ssh_client_class.return_value = mock_client
@@ -217,7 +233,7 @@ class TestGenericErrors:
         # First call raises network error, second succeeds
         mock_client.connect.side_effect = [
             OSError("Connection refused"),
-            None  # Success on retry
+            None,  # Success on retry
         ]
 
         with patch("dsync.ssh.get_passphrase", return_value="pass"):
@@ -230,7 +246,9 @@ class TestGenericErrors:
         assert mock_client.connect.call_count == 2
 
     @patch("paramiko.SSHClient")
-    def test_network_error_no_retry_when_disabled(self, mock_ssh_client_class, ssh_manager):
+    def test_network_error_no_retry_when_disabled(
+        self, mock_ssh_client_class, ssh_manager
+    ):
         """Test that network errors are not retried when retry=False."""
         mock_client = MagicMock()
         mock_ssh_client_class.return_value = mock_client
@@ -247,7 +265,9 @@ class TestPassphraseSaving:
 
     @patch("paramiko.SSHClient")
     @patch("dsync.ssh.save_config")
-    def test_offer_to_save_passphrase_on_success(self, mock_save, mock_ssh_client_class, ssh_manager):
+    def test_offer_to_save_passphrase_on_success(
+        self, mock_save, mock_ssh_client_class, ssh_manager
+    ):
         """Test that user is offered to save passphrase after successful connection."""
         import dsync.ssh
 
@@ -272,7 +292,9 @@ class TestPassphraseSaving:
     @patch("paramiko.SSHClient")
     @patch("dsync.ssh.Prompt.ask")
     @patch("dsync.ssh.save_config")
-    def test_skip_save_passphrase_when_user_declines(self, mock_save, mock_prompt, mock_ssh_client_class, ssh_manager):
+    def test_skip_save_passphrase_when_user_declines(
+        self, mock_save, mock_prompt, mock_ssh_client_class, ssh_manager
+    ):
         """Test that passphrase is not saved when user declines."""
         mock_client = MagicMock()
         mock_ssh_client_class.return_value = mock_client
@@ -286,7 +308,9 @@ class TestPassphraseSaving:
         mock_save.assert_not_called()
 
     @patch("paramiko.SSHClient")
-    def test_never_offer_to_save_if_already_saved(self, mock_ssh_client_class, ssh_manager, mock_config):
+    def test_never_offer_to_save_if_already_saved(
+        self, mock_ssh_client_class, ssh_manager, mock_config
+    ):
         """Test that save offer is skipped if passphrase already saved in config."""
         mock_client = MagicMock()
         mock_ssh_client_class.return_value = mock_client
@@ -304,7 +328,9 @@ class TestContextManager:
     """Test context manager behavior."""
 
     @patch("paramiko.SSHClient")
-    def test_context_manager_closes_connection(self, mock_ssh_client_class, ssh_manager):
+    def test_context_manager_closes_connection(
+        self, mock_ssh_client_class, ssh_manager
+    ):
         """Test that context manager properly closes connection."""
         mock_client = MagicMock()
         mock_ssh_client_class.return_value = mock_client
@@ -318,11 +344,15 @@ class TestContextManager:
         mock_client.close.assert_called_once()
 
     @patch("paramiko.SSHClient")
-    def test_context_manager_with_connection_failure(self, mock_ssh_client_class, ssh_manager):
+    def test_context_manager_with_connection_failure(
+        self, mock_ssh_client_class, ssh_manager
+    ):
         """Test that connection failure is properly raised from context manager."""
         mock_client = MagicMock()
         mock_ssh_client_class.return_value = mock_client
-        mock_client.connect.side_effect = paramiko.ssh_exception.AuthenticationException("Auth failed")
+        mock_client.connect.side_effect = (
+            paramiko.ssh_exception.AuthenticationException("Auth failed")
+        )
 
         with patch("dsync.ssh.get_passphrase", return_value="wrongpass"):
             with patch("dsync.ssh.console"):
@@ -337,12 +367,16 @@ class TestErrorMessages:
 
     @patch("paramiko.SSHClient")
     @patch("click.confirm")
-    def test_friendly_error_for_wrong_passphrase(self, mock_confirm, mock_ssh_client_class, ssh_manager):
+    def test_friendly_error_for_wrong_passphrase(
+        self, mock_confirm, mock_ssh_client_class, ssh_manager
+    ):
         """Test that wrong passphrase shows helpful error message."""
         mock_client = MagicMock()
         mock_ssh_client_class.return_value = mock_client
         mock_confirm.return_value = False
-        mock_client.connect.side_effect = ValueError("password and salt must not be empty")
+        mock_client.connect.side_effect = ValueError(
+            "password and salt must not be empty"
+        )
 
         with patch("dsync.ssh.get_passphrase", return_value="wrongpass"):
             with patch("dsync.ssh.console") as mock_console:
@@ -350,5 +384,7 @@ class TestErrorMessages:
                     ssh_manager.connect(retry=True)
 
                 # Verify helpful message was printed
-                printed_messages = [str(call) for call in mock_console.print.call_args_list]
+                printed_messages = [
+                    str(call) for call in mock_console.print.call_args_list
+                ]
                 assert any("passphrase" in str(msg).lower() for msg in printed_messages)

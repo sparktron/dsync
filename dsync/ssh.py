@@ -9,7 +9,6 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Optional
 
 import click
 import paramiko
@@ -21,12 +20,12 @@ from .config import Config, save_config
 console = Console()
 
 # Module-level caches (per process / session)
-_passphrase_cache: Optional[str] = None
+_passphrase_cache: str | None = None
 _passphrase_asked: bool = False
 _agent_env: dict[str, str] = {}
 
 
-def get_passphrase(force_new: bool = False) -> Optional[str]:
+def get_passphrase(force_new: bool = False) -> str | None:
     """Prompt for the SSH key passphrase, caching it for the session.
 
     Args:
@@ -48,7 +47,7 @@ def get_passphrase(force_new: bool = False) -> Optional[str]:
     return _passphrase_cache
 
 
-def get_rsync_env(key_path: Path, config: Optional[Config] = None) -> dict[str, str]:
+def get_rsync_env(key_path: Path, config: Config | None = None) -> dict[str, str]:
     """
     Return an environment dict that has the SSH key loaded into an agent,
     suitable for passing to rsync subprocess calls.
@@ -146,11 +145,11 @@ class SSHManager:
     Reconnects automatically if the transport drops.
     """
 
-    def __init__(self, config: Config, profile: Optional[str] = None) -> None:
+    def __init__(self, config: Config, profile: str | None = None) -> None:
         self.config = config
         self.profile = profile
-        self._client: Optional[paramiko.SSHClient] = None
-        self._sftp: Optional[paramiko.SFTPClient] = None
+        self._client: paramiko.SSHClient | None = None
+        self._sftp: paramiko.SFTPClient | None = None
         self._connection_succeeded = False
 
     # ------------------------------------------------------------------
@@ -182,7 +181,7 @@ class SSHManager:
         Returns (stdout, stderr). Raises RuntimeError if check=True and
         the command exits non-zero.
         """
-        stdin, stdout, stderr = self.client.exec_command(command)
+        _stdin, stdout, stderr = self.client.exec_command(command)
         out = stdout.read().decode()
         err = stderr.read().decode()
         exit_code = stdout.channel.recv_exit_status()
@@ -231,7 +230,7 @@ class SSHManager:
     # Context manager
     # ------------------------------------------------------------------
 
-    def __enter__(self) -> "SSHManager":
+    def __enter__(self) -> SSHManager:
         self.connect()
         return self
 
@@ -276,7 +275,7 @@ class SSHManager:
         response = Prompt.ask(
             "[yellow]Save SSH passphrase to config for future use?[/] (yes/no)",
             choices=["yes", "no"],
-            default="no"
+            default="no",
         )
         if response == "yes":
             self.config.passphrase = passphrase

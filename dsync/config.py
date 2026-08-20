@@ -43,7 +43,7 @@ class Config:
         self.backup_dir: str = data.get("backup_dir", "~/backups/dsync")
         self.ignore_patterns: list[str] = data.get("ignore_patterns", DEFAULT_IGNORE)
         self.hooks: dict[str, str] = data.get("hooks", {})
-        self.passphrase: str | None = data.get("passphrase", None)
+        self.passphrase: str | None = data.get("passphrase")
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize config to a JSON-compatible dict."""

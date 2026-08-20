@@ -19,9 +19,34 @@ dsync = "dsync.cli:cli"
 
 [project.optional-dependencies]
 dev = [
-    "ruff>=0.4",
+    "ruff==0.16.3",
+    "pytest>=8.0",
 ]
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["dsync*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+# Ruff is pinned in [dev] and in CI. Leaving it unpinned means a new release
+# can turn the build red with no code change — which is how master sat broken
+# from 2026-03-28 onward. The rule set below is likewise explicit rather than
+# inherited from whatever the current default happens to be.
+[tool.ruff]
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "RUF"]
+ignore = [
+    "E501",     # line length is the formatter's job
+    "RUF001",   # the Rich status glyphs (ℹ, ✓, ✗, ⚠) are deliberate UI
+    "RUF002",
+    "RUF003",
+    "SIM105",   # try/except/pass is deliberate for best-effort teardown;
+                # converting to contextlib.suppress is a separate cleanup
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["SIM117"]  # nested `with patch(...)` reads better than one chain

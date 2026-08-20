@@ -6,7 +6,6 @@ import shlex
 import subprocess
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
@@ -46,7 +45,7 @@ def _run_rsync(
     config: Config,
     src: str,
     dst: str,
-    extra_flags: Optional[list[str]] = None,
+    extra_flags: list[str] | None = None,
     dry_run: bool = False,
     capture: bool = True,
 ) -> subprocess.CompletedProcess[str]:
@@ -314,7 +313,7 @@ def _local_mtime(config: Config, rel_path: str) -> float:
         return 0.0
 
 
-def _remote_mtime(ssh: SSHManager, config: Config, rel_path: str) -> Optional[float]:
+def _remote_mtime(ssh: SSHManager, config: Config, rel_path: str) -> float | None:
     """Return the remote file's mtime via SFTP, or None if it can't be read."""
     try:
         attr = ssh.sftp.stat(config.remote_root + rel_path)

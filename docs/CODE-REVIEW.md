@@ -6,6 +6,9 @@ reproduced in a local checkout rather than inferred from reading.
 
 **Tally:** 5 critical · 4 high · 6 medium · 7 low
 
+> **Status:** CI-1 and TEST-1 are fixed — see the "ci: restore a green build"
+> commit on this branch. The remaining 20 findings are open.
+
 The tool's shape is sound — clean module split, idiomatic rsync wrapping, and the recent
 SSH error-handling work is good. Problems cluster in three places: nobody is watching CI,
 credential handling is weaker than `AGENTS.md` claims, and the failure paths lie to the
@@ -36,7 +39,7 @@ exercised with a driver script against the real functions.
 
 ## Critical
 
-### CI-1 — CI has been red on `master` for four months
+### CI-1 — CI has been red on `master` for four months — FIXED
 `.github/workflows/ci.yml`, `dsync/ssh.py:279`
 
 Last green build was `c519f7e` (2026-03-28). Every push since — four runs, including HEAD —
@@ -163,7 +166,7 @@ swallowed and the command appears frozen. The wrong passphrase stays cached for 
 **Fix:** check the return code; on failure clear the passphrase cache, report which key failed,
 and do not populate `_agent_env`.
 
-### TEST-1 — CI runs no tests, and `pytest` isn't a declared dependency
+### TEST-1 — CI runs no tests, and `pytest` isn't a declared dependency — FIXED
 `.github/workflows/ci.yml`, `pyproject.toml:20-23`
 
 `ci.yml` has two jobs: lint, and install-plus-`--help`. Neither invokes pytest.
@@ -277,10 +280,10 @@ confusing "Path not found" for a file that plainly exists.
 
 ## Recommended order
 
-1. **Get CI green and keep it that way.** `ruff format dsync/`, pin ruff, commit an explicit
-   `select` list. Until this lands, every other change ships blind. *(CI-1)*
-2. **Add the test job and the `--dry-run` argv tests.** Cheap, and the guardrail for everything
-   below — particularly future edits near `--delete`. *(TEST-1)*
+1. ~~**Get CI green and keep it that way.**~~ Done — formatter fix, ruff pinned in `[dev]`,
+   explicit `select` list in `pyproject.toml`. *(CI-1)*
+2. ~~**Add the test job and the `--dry-run` argv tests.**~~ Done — `tests/test_sync.py`,
+   plus a Test job across the 3.9–3.12 matrix. *(TEST-1)*
 3. **Fix the two lies.** `rsync_status` must fail loudly; the log must record what happened.
    Both small, both restore trust in the tool's output. *(BUG-1, BUG-5)*
 4. **Confine paths to the roots.** Turn the silent `except ValueError: pass` into a hard error
