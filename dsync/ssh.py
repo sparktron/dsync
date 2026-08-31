@@ -276,7 +276,7 @@ class SSHManager:
         response = Prompt.ask(
             "[yellow]Save SSH passphrase to config for future use?[/] (yes/no)",
             choices=["yes", "no"],
-            default="no"
+            default="no",
         )
         if response == "yes":
             self.config.passphrase = passphrase
