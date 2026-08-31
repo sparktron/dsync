@@ -15,7 +15,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install ruff
+      # Pinned deliberately: ruff's default rule set is not stable across
+      # releases, and an unpinned install turns this job red on unchanged code.
+      # Bump this and the pin in pyproject.toml together.
+      - run: pip install ruff==0.16.5
       - run: ruff check dsync/
       - run: ruff format --check dsync/
 
