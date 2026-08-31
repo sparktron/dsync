@@ -7,7 +7,7 @@ import io
 import threading
 import time
 import webbrowser
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import click
@@ -15,7 +15,7 @@ from rich.console import Console
 from rich.syntax import Syntax
 from rich.table import Table
 
-from .config import load_config, list_profiles
+from .config import list_profiles, load_config
 from .log import append_log, read_log
 from .ssh import SSHManager
 from .state import StateManager, _matches_ignore
@@ -24,10 +24,10 @@ from .sync import (
     create_full_backup,
     file_to_url,
     push_single_file,
+    rsync_pull,
     rsync_push_all,
     rsync_push_directory,
     rsync_push_dry_run,
-    rsync_pull,
     rsync_status,
     run_hook,
 )
@@ -273,7 +273,7 @@ def watch(ctx: click.Context) -> None:
         with _upload_lock:
             success = push_single_file(ssh, config, state, rel_path)
         duration_ms = int((time.monotonic() - t0) * 1000)
-        timestamp = datetime.now().strftime("%H:%M:%S")
+        timestamp = datetime.now(timezone.utc).astimezone().strftime("%H:%M:%S")
         if success:
             with _retry_lock:
                 _retry_state.pop(rel_path, None)

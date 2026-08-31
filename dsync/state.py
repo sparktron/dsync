@@ -6,8 +6,9 @@ import fnmatch
 import hashlib
 import json
 import time
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 _STATE_DIR = Path.home() / ".dsync"
 
@@ -44,7 +45,7 @@ class FileState:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "FileState":
+    def from_dict(cls, data: dict[str, Any]) -> FileState:
         """Deserialize from a JSON dict."""
         return cls(
             mtime=data["mtime"],

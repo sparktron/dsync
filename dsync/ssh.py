@@ -68,11 +68,14 @@ def get_rsync_env(key_path: Path, config: Optional[Config] = None) -> dict[str, 
 
     # If the user already has an agent running with the key loaded, use it.
     if "SSH_AUTH_SOCK" in os.environ:
-        listed = subprocess.run(["ssh-add", "-l"], capture_output=True, text=True)
+        listed = subprocess.run(
+            ["ssh-add", "-l"], capture_output=True, text=True, check=False
+        )
         keygen = subprocess.run(
             ["ssh-keygen", "-l", "-f", str(key_path)],
             capture_output=True,
             text=True,
+            check=False,
         )
         if listed.returncode == 0 and keygen.returncode == 0:
             fp = keygen.stdout.split()[1] if keygen.stdout.strip() else ""
@@ -86,7 +89,9 @@ def get_rsync_env(key_path: Path, config: Optional[Config] = None) -> dict[str, 
         passphrase = config.passphrase
     else:
         passphrase = get_passphrase()
-    agent_result = subprocess.run(["ssh-agent", "-s"], capture_output=True, text=True)
+    agent_result = subprocess.run(
+        ["ssh-agent", "-s"], capture_output=True, text=True, check=False
+    )
     new_env: dict[str, str] = {}
     for line in agent_result.stdout.splitlines():
         m = re.match(r"(\w+)=([^;]+);", line)
@@ -119,6 +124,7 @@ def get_rsync_env(key_path: Path, config: Optional[Config] = None) -> dict[str, 
                 env=add_env,
                 capture_output=True,
                 stdin=subprocess.DEVNULL,
+                check=False,
             )
         finally:
             try:
@@ -132,6 +138,7 @@ def get_rsync_env(key_path: Path, config: Optional[Config] = None) -> dict[str, 
             env={**os.environ, **new_env},
             capture_output=True,
             stdin=subprocess.DEVNULL,
+            check=False,
         )
 
     _agent_env = new_env
@@ -182,7 +189,7 @@ class SSHManager:
         Returns (stdout, stderr). Raises RuntimeError if check=True and
         the command exits non-zero.
         """
-        stdin, stdout, stderr = self.client.exec_command(command)
+        _stdin, stdout, stderr = self.client.exec_command(command)
         out = stdout.read().decode()
         err = stderr.read().decode()
         exit_code = stdout.channel.recv_exit_status()
@@ -231,7 +238,7 @@ class SSHManager:
     # Context manager
     # ------------------------------------------------------------------
 
-    def __enter__(self) -> "SSHManager":
+    def __enter__(self) -> SSHManager:
         self.connect()
         return self
 

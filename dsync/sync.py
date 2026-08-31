@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import shlex
 import subprocess
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -65,6 +65,7 @@ def _run_rsync(
         capture_output=capture,
         text=True,
         env=env,
+        check=False,
     )
 
 
@@ -353,7 +354,7 @@ def _remote_backup_base(ssh: SSHManager, config: Config) -> str:
 
 def _backup_remote_file(ssh: SSHManager, config: Config, rel_path: str) -> None:
     """Copy a single remote file to the timestamped backup directory."""
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    timestamp = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d_%H-%M-%S")
     backup_base = _remote_backup_base(ssh, config)
     safe_name = rel_path.replace("/", "_")
     backup_path = f"{backup_base}/{timestamp}_{safe_name}"
@@ -372,7 +373,7 @@ def backup_remote_files(ssh: SSHManager, config: Config, rel_paths: list[str]) -
     Creates a timestamped directory under the remote backup base and
     copies each file there. Returns the backup directory path.
     """
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    timestamp = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d_%H-%M-%S")
     backup_base = _remote_backup_base(ssh, config)
     backup_dir = f"{backup_base}/{timestamp}"
     ssh.run(f"mkdir -p {shlex.quote(backup_dir)}")
@@ -394,7 +395,7 @@ def create_full_backup(ssh: SSHManager, config: Config) -> str:
     Stores the archive under the remote backup directory with a
     timestamp in the filename. Returns the remote path of the archive.
     """
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    timestamp = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d_%H-%M-%S")
     backup_base = _remote_backup_base(ssh, config)
     backup_path = f"{backup_base}/{timestamp}.tar.gz"
     ssh.run(f"mkdir -p {shlex.quote(backup_base)}")
@@ -427,6 +428,7 @@ def run_hook(config: Config, hook: str) -> bool:
         shell=True,
         cwd=str(config.local_root),
         text=True,
+        check=False,
     )
     if result.returncode != 0:
         console.print(
