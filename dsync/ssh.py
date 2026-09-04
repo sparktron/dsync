@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import os
 import re
 import shlex
@@ -15,7 +16,7 @@ import paramiko
 from rich.console import Console
 from rich.prompt import Prompt
 
-from .config import Config, save_config
+from .config import Config
 
 console = Console()
 
@@ -23,6 +24,13 @@ console = Console()
 _passphrase_cache: str | None = None
 _passphrase_asked: bool = False
 _agent_env: dict[str, str] = {}
+
+# Set only when *we* started the agent, so teardown never kills the user's own.
+_own_agent_env: dict[str, str] = {}
+
+# Keys we load expire on their own, so a missed teardown (SIGKILL, crash) does
+# not leave the decrypted key resident indefinitely.
+AGENT_KEY_LIFETIME_SECONDS = 3600
 
 
 def get_passphrase(force_new: bool = False) -> str | None:
@@ -48,16 +56,142 @@ def get_passphrase(force_new: bool = False) -> str | None:
 
 
 def _run_tool(cmd: list[str], **kwargs) -> subprocess.CompletedProcess[str] | None:
-    """Run an ssh helper binary, returning None if it is not installed.
+    """Run an ssh helper binary, returning None if it is missing or times out.
 
     ssh-agent, ssh-add and ssh-keygen are not guaranteed to be present. Letting
     a missing binary raise FileNotFoundError turns every push into a traceback;
     degrading to the caller's own environment lets ssh prompt instead.
+
+    A timeout is honoured because ssh-add can spin forever: given SSH_ASKPASS
+    plus SSH_ASKPASS_REQUIRE=force, a rejected passphrase sends it round its
+    retry loop with no tty to give up on.
     """
     try:
         return subprocess.run(cmd, capture_output=True, text=True, **kwargs)
     except FileNotFoundError:
         return None
+    except subprocess.TimeoutExpired:
+        return None
+
+
+def _key_fingerprint(key_path: Path) -> str:
+    """Return the key's fingerprint, or "" if it cannot be read."""
+    keygen = _run_tool(["ssh-keygen", "-l", "-f", str(key_path)])
+    if keygen is None or keygen.returncode != 0:
+        return ""
+    fields = keygen.stdout.split()
+    return fields[1] if len(fields) > 1 else ""
+
+
+def agent_has_key(key_path: Path) -> bool:
+    """True if a reachable ssh-agent already holds this key."""
+    if "SSH_AUTH_SOCK" not in os.environ:
+        return False
+    listed = _run_tool(["ssh-add", "-l"])
+    if listed is None or listed.returncode != 0:
+        return False
+    fingerprint = _key_fingerprint(key_path)
+    return bool(fingerprint) and fingerprint in listed.stdout
+
+
+def key_is_encrypted(key_path: Path) -> bool:
+    """True if the private key needs a passphrase to load.
+
+    Anything unreadable is reported as unencrypted so we do not prompt for a key
+    that does not exist — the connection attempt then fails with a real error.
+    """
+    for key_class in (paramiko.RSAKey, paramiko.ECDSAKey, paramiko.Ed25519Key):
+        try:
+            key_class.from_private_key_file(str(key_path))
+            return False  # loaded without a passphrase
+        except paramiko.ssh_exception.PasswordRequiredException:
+            return True
+        except Exception:
+            continue  # wrong key type for this class, or unreadable
+    return False
+
+
+# ssh-add is bounded: a wrong passphrase must fail, not hang the whole command.
+SSH_ADD_TIMEOUT_SECONDS = 20
+
+
+def _ssh_add(
+    key_path: Path,
+    passphrase: str | None,
+    env: dict[str, str],
+    extra_args: list[str] | None = None,
+) -> subprocess.CompletedProcess[str] | None:
+    """Add a key to the agent identified by *env*. None means it did not run.
+
+    The askpass helper is one-shot: it deletes itself as it runs, so ssh-add's
+    retry loop gets nothing on a second attempt and gives up instead of
+    re-submitting the same rejected passphrase forever.
+    """
+    cmd = ["ssh-add", *(extra_args or []), str(key_path)]
+    if not passphrase:
+        return _run_tool(
+            cmd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            timeout=SSH_ADD_TIMEOUT_SECONDS,
+        )
+
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".sh", delete=False, prefix="dsync_askpass_"
+    ) as f:
+        f.write(f"#!/bin/sh\nrm -f \"$0\"\nprintf '%s' {shlex.quote(passphrase)}\n")
+        askpass_path = f.name
+    os.chmod(askpass_path, 0o700)
+    try:
+        return _run_tool(
+            cmd,
+            env={
+                **env,
+                "SSH_ASKPASS": askpass_path,
+                "SSH_ASKPASS_REQUIRE": "force",  # OpenSSH ≥ 8.4
+                "DISPLAY": os.environ.get("DISPLAY", ":0"),
+            },
+            stdin=subprocess.DEVNULL,
+            timeout=SSH_ADD_TIMEOUT_SECONDS,
+        )
+    finally:
+        try:
+            os.unlink(askpass_path)
+        except OSError:
+            pass  # the one-shot script already removed itself
+
+
+def load_key_into_agent(key_path: Path, passphrase: str | None = None) -> bool:
+    """Add a key to the user's running ssh-agent. Returns True on success.
+
+    Used by the one-time migration away from storing the passphrase in config,
+    so the move costs the user at most one prompt.
+    """
+    if "SSH_AUTH_SOCK" not in os.environ:
+        console.print("[yellow]⚠[/] No ssh-agent is running (SSH_AUTH_SOCK is unset).")
+        return False
+    added = _ssh_add(key_path, passphrase, dict(os.environ))
+    return added is not None and added.returncode == 0
+
+
+def shutdown_agent() -> None:
+    """Kill the ssh-agent this process started, if any. Never the user's own."""
+    global _own_agent_env, _agent_env
+    if not _own_agent_env:
+        return
+    _run_tool(["ssh-agent", "-k"], env={**os.environ, **_own_agent_env})
+    _own_agent_env = {}
+    _agent_env = {}
+
+
+atexit.register(shutdown_agent)
+
+
+def reset_passphrase_cache() -> None:
+    """Forget the cached passphrase so the next request prompts again."""
+    global _passphrase_cache, _passphrase_asked
+    _passphrase_cache = None
+    _passphrase_asked = False
 
 
 def get_rsync_env(key_path: Path, config: Config | None = None) -> dict[str, str]:
@@ -72,28 +206,21 @@ def get_rsync_env(key_path: Path, config: Config | None = None) -> dict[str, str
     Reuses an already-running agent if the key is already loaded;
     otherwise starts a fresh ssh-agent and adds the key via SSH_ASKPASS.
     """
-    global _agent_env
+    global _agent_env, _own_agent_env
 
     # Return cached agent env if we've already set one up this session.
     if _agent_env:
         return {**os.environ, **_agent_env}
 
-    # If the user already has an agent running with the key loaded, use it.
-    if "SSH_AUTH_SOCK" in os.environ:
-        listed = _run_tool(["ssh-add", "-l"])
-        keygen = _run_tool(["ssh-keygen", "-l", "-f", str(key_path)])
-        if listed and keygen and listed.returncode == 0 and keygen.returncode == 0:
-            fp = keygen.stdout.split()[1] if keygen.stdout.strip() else ""
-            if fp and fp in listed.stdout:
-                _agent_env = {"SSH_AUTH_SOCK": os.environ["SSH_AUTH_SOCK"]}
-                return dict(os.environ)
+    # If the user already has an agent running with the key loaded, use it —
+    # and leave it alone: we never add to or kill an agent we did not start.
+    if agent_has_key(key_path):
+        _agent_env = {"SSH_AUTH_SOCK": os.environ["SSH_AUTH_SOCK"]}
+        return dict(os.environ)
 
-    # Start a fresh ssh-agent.
-    # Use stored passphrase from config if available, otherwise prompt
-    if config and config.passphrase is not None:
-        passphrase = config.passphrase
-    else:
-        passphrase = get_passphrase()
+    passphrase = get_passphrase() if key_is_encrypted(key_path) else None
+
+    # Start a fresh ssh-agent, which shutdown_agent() tears down at exit.
     agent_result = _run_tool(["ssh-agent", "-s"])
     new_env: dict[str, str] = {}
     if agent_result is not None:
@@ -109,42 +236,35 @@ def get_rsync_env(key_path: Path, config: Config | None = None) -> dict[str, str
         )
         return dict(os.environ)
 
-    if passphrase:
-        # Write a temporary askpass script that feeds the passphrase to ssh-add.
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".sh", delete=False, prefix="dsync_askpass_"
-        ) as f:
-            f.write(f"#!/bin/sh\nprintf '%s' {shlex.quote(passphrase)}\n")
-            askpass_path = f.name
-        os.chmod(askpass_path, 0o700)
+    added = _ssh_add(
+        key_path,
+        passphrase,
+        {**os.environ, **new_env},
+        extra_args=["-t", str(AGENT_KEY_LIFETIME_SECONDS)],
+    )
 
-        try:
-            add_env = {
-                **os.environ,
-                **new_env,
-                "SSH_ASKPASS": askpass_path,
-                "SSH_ASKPASS_REQUIRE": "force",  # OpenSSH ≥ 8.4
-                "DISPLAY": os.environ.get("DISPLAY", ":0"),
-            }
-            _run_tool(
-                ["ssh-add", str(key_path)],
-                env=add_env,
-                stdin=subprocess.DEVNULL,
+    if added is None or added.returncode != 0:
+        # Caching a broken agent env would point rsync at an agent holding no
+        # keys, and ssh's own prompt is captured by _run_rsync — which looks
+        # exactly like a hang. Tear it down and let ssh prompt instead.
+        raw = (added.stderr or "").strip() if added else "ssh-add did not complete"
+        if passphrase:
+            # The one-shot askpass is spent after the first attempt, so ssh-add
+            # asking a second time means the first passphrase was rejected.
+            console.print(
+                f"[yellow]⚠[/] ssh-agent rejected the passphrase for {key_path}."
             )
-        finally:
-            try:
-                os.unlink(askpass_path)
-            except OSError:
-                pass
-    else:
-        # Unencrypted key — no passphrase needed, so skip the askpass dance.
-        _run_tool(
-            ["ssh-add", str(key_path)],
-            env={**os.environ, **new_env},
-            stdin=subprocess.DEVNULL,
-        )
+            console.print("   ssh will ask for it directly instead.")
+            reset_passphrase_cache()  # do not reuse a rejected passphrase
+        else:
+            console.print(
+                f"[yellow]⚠[/] Could not load {key_path} into ssh-agent: {raw or 'unknown error'}"
+            )
+        _run_tool(["ssh-agent", "-k"], env={**os.environ, **new_env})
+        return dict(os.environ)
 
     _agent_env = new_env
+    _own_agent_env = new_env
     return {**os.environ, **_agent_env}
 
 
@@ -177,7 +297,6 @@ class SSHManager:
             self._do_connect()
             console.print("[green]✓[/] Connected")
             self._connection_succeeded = True
-            self._offer_to_save_passphrase()
         except paramiko.ssh_exception.AuthenticationException as exc:
             self._handle_auth_failure(exc, retry=retry)
         except (ValueError, paramiko.ssh_exception.SSHException) as exc:
@@ -252,13 +371,24 @@ class SSHManager:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _passphrase_for_connect(self) -> str | None:
+        """The passphrase to connect with, or None if one is not needed.
+
+        paramiko tries key_filename before agent keys, and swallows the
+        PasswordRequiredException from a passphrase-less load of an encrypted
+        key before falling through to the agent. So whenever the agent already
+        holds this key — or the key is unencrypted — connecting with None
+        succeeds and there is nothing to ask the user.
+        """
+        if agent_has_key(self.config.key_path):
+            return None
+        if not key_is_encrypted(self.config.key_path):
+            return None
+        return get_passphrase()
+
     def _do_connect(self) -> None:
         """Perform the actual paramiko connection."""
-        # Use stored passphrase if available, otherwise prompt
-        if self.config.passphrase is not None:
-            passphrase = self.config.passphrase
-        else:
-            passphrase = get_passphrase()
+        passphrase = self._passphrase_for_connect()
 
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -272,28 +402,6 @@ class SSHManager:
         )
         self._client = client
         self._sftp = None  # opened lazily
-
-    def _offer_to_save_passphrase(self) -> None:
-        """Offer to save the passphrase to config for future use."""
-        # Only offer if we successfully connected and don't already have a saved passphrase
-        if not self._connection_succeeded or self.config.passphrase is not None:
-            return
-
-        passphrase = _passphrase_cache
-        if passphrase is None:
-            return
-
-        response = Prompt.ask(
-            "[yellow]Save SSH passphrase to config for future use?[/] (yes/no)",
-            choices=["yes", "no"],
-            default="no",
-        )
-        if response == "yes":
-            self.config.passphrase = passphrase
-            save_config(self.config, profile=self.profile)
-            console.print("[green]✓[/] Passphrase saved to config")
-        else:
-            console.print("[dim]Passphrase not saved[/]")
 
     def _handle_auth_failure(self, exc: Exception, retry: bool = True) -> None:
         """Handle authentication failures (wrong passphrase or key rejection)."""
@@ -309,7 +417,6 @@ class SSHManager:
                 self._do_connect_with_new_passphrase()
                 console.print("[green]✓[/] Connected")
                 self._connection_succeeded = True
-                self._offer_to_save_passphrase()
             except Exception as e:
                 console.print(f"[red]✗[/] Connection still failed: {e}")
                 raise
@@ -329,7 +436,6 @@ class SSHManager:
                         self._do_connect_with_new_passphrase()
                         console.print("[green]✓[/] Connected")
                         self._connection_succeeded = True
-                        self._offer_to_save_passphrase()
                     except Exception as e:
                         console.print(f"[red]✗[/] Connection still failed: {e}")
                         raise
@@ -351,7 +457,6 @@ class SSHManager:
                 self._do_connect()
                 console.print("[green]✓[/] Connected")
                 self._connection_succeeded = True
-                self._offer_to_save_passphrase()
             except Exception as e:
                 console.print(f"[red]✗[/] Retry failed: {e}")
                 raise

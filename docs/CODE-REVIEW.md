@@ -6,10 +6,10 @@ reproduced in a local checkout rather than inferred from reading.
 
 **Tally:** 5 critical · 4 high · 6 medium · 7 low
 
-> **Status:** CI-1, TEST-1, BUG-1, BUG-5, BUG-2 and BUG-9 are fixed on this
-> branch, along with the `rsync_pull` dead-deletion reporting listed under Low.
-> 15 findings remain open. Next is the credential group (SEC-2, SEC-3, BUG-4),
-> which needs a decision on whether to keep passphrase storage at all.
+> **Status:** CI-1, TEST-1, BUG-1, BUG-5, BUG-2, BUG-9, SEC-2, SEC-3 and BUG-4
+> are fixed on this branch, along with the `rsync_pull` dead-deletion reporting
+> listed under Low. 12 findings remain open. SEC-1 (host key verification) is the
+> most serious of them and needs a first-run trust flow designed.
 
 The tool's shape is sound — clean module split, idiomatic rsync wrapping, and the recent
 SSH error-handling work is good. Problems cluster in three places: nobody is watching CI,
@@ -67,7 +67,7 @@ genuine host key change is never surfaced.
 **Fix:** drop both `-o` flags and use `~/.ssh/known_hosts`. In paramiko call
 `load_system_host_keys()` with `RejectPolicy`, plus a first-run prompt showing the fingerprint.
 
-### SEC-2 — SSH key passphrase written to a world-readable file in cleartext
+### SEC-2 — SSH key passphrase written to a world-readable file in cleartext — FIXED
 `dsync/config.py:89-94`, `dsync/ssh.py:266-286`
 
 `_offer_to_save_passphrase` persists the passphrase and `save_config` writes it as plain JSON
@@ -128,7 +128,7 @@ branch should be a hard error, not `pass`. Assert the same remote-side with `pos
 
 ## High
 
-### SEC-3 — Every rsync run leaks an ssh-agent holding the decrypted key, forever
+### SEC-3 — Every rsync run leaks an ssh-agent holding the decrypted key, forever — FIXED
 `dsync/ssh.py:89-138`
 
 `get_rsync_env` spawns `ssh-agent -s` and adds the key. There is no `ssh-agent -k` anywhere and
@@ -157,7 +157,7 @@ that drops once will wedge.
 add a `connect(interactive=False)` path reporting failure by return value, and offer to save the
 passphrase only at initial connect.
 
-### BUG-4 — `ssh-add`'s exit status is discarded, so a bad passphrase surfaces as a hang
+### BUG-4 — `ssh-add`'s exit status is discarded, so a bad passphrase surfaces as a hang — FIXED
 `dsync/ssh.py:117-137`
 
 Both `ssh-add` calls use `capture_output=True` and never check `returncode`; `_agent_env` is
@@ -167,6 +167,13 @@ swallowed and the command appears frozen. The wrong passphrase stays cached for 
 
 **Fix:** check the return code; on failure clear the passphrase cache, report which key failed,
 and do not populate `_agent_env`.
+
+**Update, found while fixing:** this is worse than described above. With `SSH_ASKPASS` plus
+`SSH_ASKPASS_REQUIRE=force`, a rejected passphrase sends `ssh-add` round its retry loop with no
+tty to give up on — observed spinning at 100% CPU indefinitely, so there is no exit status to
+check. Checking the return code is necessary but not sufficient. The askpass helper is now
+one-shot (it removes itself as it runs, so the retry finds nothing), with a timeout as backstop;
+the failure now surfaces in about a second.
 
 ### TEST-1 — CI runs no tests, and `pytest` isn't a declared dependency — FIXED
 `.github/workflows/ci.yml`, `pyproject.toml:20-23`
@@ -292,8 +299,10 @@ confusing "Path not found" for a file that plainly exists.
 4. ~~**Confine paths to the roots.**~~ Done — `relative_to_root` and `remote_path_for`
    centralise the policy, `local_root` is resolved, and the target is validated before
    any connection is opened. *(BUG-2, BUG-9)*
-5. **Close the credential gaps.** Config to `0600`, agent lifetime bounded, `ssh-add` failures
-   surfaced. *(SEC-2, SEC-3, BUG-4)*
+5. ~~**Close the credential gaps.**~~ Done — the passphrase is no longer stored at all
+   (the ssh-agent holds it, with a one-time migration), only agents dsync started are ever
+   killed, and `ssh-add` is bounded by a one-shot askpass plus a timeout.
+   *(SEC-2, SEC-3, BUG-4)*
 6. **Restore host key verification.** Last, because it needs a first-run trust flow designed
    rather than a flag flipped — and it will correctly refuse to connect until that exists. *(SEC-1)*
 7. **Then the rest:** watch-mode thread safety, backup retention, batched round trips, URL

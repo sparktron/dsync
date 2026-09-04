@@ -61,6 +61,17 @@ This tool writes to a live public website over SSH. Treat every change to
 - rsync `--delete` semantics are destructive on the remote. Never widen the
   delete scope or change exclude patterns without saying so explicitly.
 - Never log credentials, key material, or full SSH URIs with embedded auth.
+- The SSH key passphrase is never written to disk. It lives in the ssh-agent;
+  `Config` still reads a legacy `passphrase` key so old configs work, but
+  `to_dict` never emits it and `migrate_stored_passphrase` strips it on load.
+  Config files are written `0600` inside a `0700` directory via `os.open`.
+- Only ever kill or add to an ssh-agent that dsync itself started (`_own_agent_env`).
+  Keys dsync adds carry `-t AGENT_KEY_LIFETIME_SECONDS` so a missed teardown
+  still expires them.
+- Every `ssh-add` goes through `_ssh_add`, which uses a **one-shot** askpass
+  helper and a timeout. With `SSH_ASKPASS_REQUIRE=force` and a re-answerable
+  helper, a rejected passphrase sends ssh-add round its retry loop forever with
+  no tty to give up on — verified spinning at 100% CPU. Do not remove either guard.
 - Every local path from a user goes through `relative_to_root`, and every remote
   path through `remote_path_for`. Both refuse to leave their configured root.
   Never rebuild a remote path with `config.remote_root + rel_path` — `lstrip("/")`
