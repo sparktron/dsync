@@ -215,3 +215,81 @@ class TestCliOutcomes:
         result = CliRunner().invoke(cli.cli, ["prune-backups", "--days", "30"], input="n\n")
         assert result.exit_code == 0
         delete.assert_not_called()
+
+
+class TestHostKeyStore:
+    """Host-key verification must fail closed when known_hosts is unusable."""
+
+    def test_unreadable_known_hosts_aborts(self, tmp_path, monkeypatch):
+        import paramiko
+
+        from dsync import ssh as ssh_mod
+
+        kh = tmp_path / "known_hosts"
+        kh.write_text("")
+        monkeypatch.setattr(ssh_mod, "KNOWN_HOSTS", kh)
+        client = MagicMock()
+        client.load_system_host_keys.side_effect = PermissionError("denied")
+        with pytest.raises(paramiko.SSHException, match="Cannot read"):
+            ssh_mod._load_known_hosts(client)
+        client.load_system_host_keys.assert_called_once_with(str(kh))
+
+    def test_missing_known_hosts_is_first_use(self, tmp_path, monkeypatch):
+        from dsync import ssh as ssh_mod
+
+        monkeypatch.setattr(ssh_mod, "KNOWN_HOSTS", tmp_path / "absent")
+        client = MagicMock()
+        ssh_mod._load_known_hosts(client)
+        client.load_system_host_keys.assert_not_called()
+
+    def test_unwritable_store_refuses_new_key(self, tmp_path, monkeypatch):
+        import paramiko
+
+        from dsync import ssh as ssh_mod
+
+        kh = tmp_path / "known_hosts"
+        kh.mkdir()  # opening a directory for append fails
+        monkeypatch.setattr(ssh_mod, "KNOWN_HOSTS", kh)
+        client = MagicMock()
+        with pytest.raises(paramiko.SSHException, match="Refusing unknown host"):
+            ssh_mod._AcceptNewPolicy().missing_host_key(client, "h", MagicMock())
+        client.get_host_keys.return_value.add.assert_not_called()
+
+    def test_new_key_recorded(self, tmp_path, monkeypatch):
+        from dsync import ssh as ssh_mod
+
+        kh = tmp_path / ".ssh" / "known_hosts"
+        monkeypatch.setattr(ssh_mod, "KNOWN_HOSTS", kh)
+        monkeypatch.setattr(ssh_mod, "console", MagicMock())
+        key = MagicMock()
+        key.get_name.return_value = "ssh-ed25519"
+        key.get_base64.return_value = "AAAA"
+        key.asbytes.return_value = b"k"
+        ssh_mod._AcceptNewPolicy().missing_host_key(MagicMock(), "[h]:2222", key)
+        assert kh.read_text() == "[h]:2222 ssh-ed25519 AAAA\n"
+
+
+class TestUploadSucceedsDespiteMetadataErrors:
+    def test_utime_rejected_still_success(self, config, tmp_path, monkeypatch):
+        from dsync import sync
+
+        monkeypatch.setattr("dsync.state._state_file_for", lambda p: tmp_path / "s.json")
+        (config.local_root / "a.html").write_text("x")
+        ssh = MagicMock()
+        ssh.run.return_value = ("", "")
+        ssh.sftp.utime.side_effect = OSError("SETSTAT unsupported")
+        state = StateManager()
+
+        assert sync.push_single_file(ssh, config, state, "a.html") is True
+        ssh.sftp.put.assert_called_once()
+        assert state.get("a.html") is not None
+
+    def test_put_failure_is_failure(self, config, tmp_path, monkeypatch):
+        from dsync import sync
+
+        monkeypatch.setattr("dsync.state._state_file_for", lambda p: tmp_path / "s.json")
+        (config.local_root / "a.html").write_text("x")
+        ssh = MagicMock()
+        ssh.run.return_value = ("", "")
+        ssh.sftp.put.side_effect = OSError("quota exceeded")
+        assert sync.push_single_file(ssh, config, StateManager(), "a.html") is False

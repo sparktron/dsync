@@ -274,18 +274,32 @@ def push_single_file(
         console.print(f"[red]✗[/] Could not create remote directory: {e}")
         return False
 
-    # Upload via SFTP, then carry the local mtime over as rsync -a would, so
-    # `status` can tell which side is newer.
     try:
         ssh.sftp.put(str(local_path), remote_path)
-        st = local_path.stat()
-        ssh.sftp.utime(remote_path, (st.st_atime, st.st_mtime))
-        state.update(rel_path, local_path)
-        state.save()
-        return True
     except Exception as e:
         console.print(f"[red]✗[/] Upload failed for {rel_path}: {e}")
         return False
+
+    # The file is live from here on, so nothing below may report failure
+    # (watch would retry, and the log would record a deploy that happened as
+    # failed).
+
+    # Carry the local mtime over as rsync -a would, so `status` can tell which
+    # side is newer. Some SFTP servers refuse SETSTAT; that is cosmetic.
+    try:
+        st = local_path.stat()
+        ssh.sftp.utime(remote_path, (st.st_atime, st.st_mtime))
+    except Exception as e:
+        console.print(f"[yellow]⚠[/] Uploaded {rel_path}, but could not set mtime: {e}")
+
+    try:
+        state.update(rel_path, local_path)
+        state.save()
+    except Exception as e:
+        console.print(
+            f"[yellow]⚠[/] Uploaded {rel_path}, but could not update sync state: {e}"
+        )
+    return True
 
 
 # ---------------------------------------------------------------------------

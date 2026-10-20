@@ -52,24 +52,47 @@ class _AcceptNewPolicy(paramiko.MissingHostKeyPolicy):
     A host with no known key is trusted on first contact and recorded in
     ~/.ssh/known_hosts (shared with the ssh that rsync runs). A host whose key
     *changed* never reaches this policy: paramiko raises BadHostKeyException.
+
+    Fails closed: if the key cannot be recorded, the connection is refused,
+    since an unwritable store would otherwise make every key "new".
     """
 
     def missing_host_key(
         self, client: paramiko.SSHClient, hostname: str, key: paramiko.PKey
     ) -> None:
-        client.get_host_keys().add(hostname, key.get_name(), key)
         try:
             KNOWN_HOSTS.parent.mkdir(mode=0o700, exist_ok=True)
             with KNOWN_HOSTS.open("a") as f:
                 f.write(f"{hostname} {key.get_name()} {key.get_base64()}\n")
         except OSError as exc:
-            console.print(f"[yellow]⚠[/] Could not record host key: {exc}")
+            raise paramiko.SSHException(
+                f"Refusing unknown host {hostname}: could not record its key "
+                f"in {KNOWN_HOSTS}: {exc}"
+            ) from exc
+        client.get_host_keys().add(hostname, key.get_name(), key)
         digest = base64.b64encode(hashlib.sha256(key.asbytes()).digest())
         fingerprint = "SHA256:" + digest.decode().rstrip("=")
         console.print(
             f"[yellow]⚠[/] New host key for {hostname} "
             f"({key.get_name()} {fingerprint}) — added to {KNOWN_HOSTS}"
         )
+
+
+def _load_known_hosts(client: paramiko.SSHClient) -> None:
+    """Load ~/.ssh/known_hosts so a changed server key raises BadHostKeyException.
+
+    Passes the path explicitly: paramiko's no-argument form silently ignores
+    read errors, which would leave no keys loaded and let _AcceptNewPolicy
+    trust any key. Only a genuinely absent file (first use) is tolerated.
+    """
+    if not KNOWN_HOSTS.exists():
+        return
+    try:
+        client.load_system_host_keys(str(KNOWN_HOSTS))
+    except OSError as exc:
+        raise paramiko.SSHException(
+            f"Cannot read {KNOWN_HOSTS} to verify the server: {exc}"
+        ) from exc
 
 
 def get_passphrase(force_new: bool = False) -> Optional[str]:
@@ -330,12 +353,7 @@ class SSHManager:
             passphrase = get_passphrase()
 
         client = paramiko.SSHClient()
-        # Verify the server against ~/.ssh/known_hosts; a changed key raises
-        # BadHostKeyException regardless of the missing-key policy.
-        try:
-            client.load_system_host_keys()
-        except OSError as exc:
-            console.print(f"[yellow]⚠[/] Could not read known_hosts: {exc}")
+        _load_known_hosts(client)
         client.set_missing_host_key_policy(_AcceptNewPolicy())
         client.connect(
             hostname=self.config.host,
