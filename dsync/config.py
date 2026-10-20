@@ -9,8 +9,9 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+import click
 from rich.console import Console
-from rich.prompt import Prompt
+from rich.prompt import IntPrompt, Prompt
 
 console = Console()
 
@@ -37,21 +38,50 @@ DEFAULT_IGNORE: list[str] = [
 ]
 
 
+REQUIRED_KEYS = (
+    "host",
+    "port",
+    "user",
+    "key_path",
+    "local_root",
+    "remote_root",
+    "site_url",
+)
+
+
+class ConfigError(click.ClickException):
+    """The config file is missing, malformed, or incomplete."""
+
+
 class Config:
     """Holds all dsync configuration values."""
 
     def __init__(self, data: dict[str, Any]) -> None:
+        missing = [k for k in REQUIRED_KEYS if k not in data]
+        if missing:
+            raise ConfigError(
+                f"Config is missing required key(s): {', '.join(missing)}"
+            )
+        try:
+            self.port: int = int(data["port"])
+        except (TypeError, ValueError):
+            raise ConfigError(
+                f"Config 'port' must be a number, got {data['port']!r}"
+            ) from None
         self.host: str = data["host"]
-        self.port: int = int(data["port"])
         self.user: str = data["user"]
         self.key_path: Path = Path(data["key_path"]).expanduser()
         self.local_root: Path = Path(data["local_root"]).expanduser()
         self.remote_root: str = data["remote_root"].rstrip("/") + "/"
         self.site_url: str = data["site_url"].rstrip("/")
         self.backup_dir: str = data.get("backup_dir", "~/backups/dsync")
-        self.ignore_patterns: list[str] = data.get("ignore_patterns", DEFAULT_IGNORE)
+        self.ignore_patterns: list[str] = list(
+            data.get("ignore_patterns", DEFAULT_IGNORE)
+        )
         self.hooks: dict[str, str] = data.get("hooks", {})
         self.passphrase: str | None = data.get("passphrase", None)
+        # Default retention for `dsync prune-backups`; None means "ask".
+        self.backup_keep_days: int | None = data.get("backup_keep_days")
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize config to a JSON-compatible dict."""
@@ -69,6 +99,8 @@ class Config:
         }
         if self.passphrase is not None:
             data["passphrase"] = self.passphrase
+        if self.backup_keep_days is not None:
+            data["backup_keep_days"] = self.backup_keep_days
         return data
 
 
@@ -136,8 +168,13 @@ def load_config(profile: str | None = None) -> Config:
     path = _config_file(profile)
     if not path.exists():
         return run_wizard(profile=profile)
-    with path.open() as f:
-        data = json.load(f)
+    try:
+        with path.open() as f:
+            data = json.load(f)
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"{path} is not valid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ConfigError(f"{path} must contain a JSON object")
     config = Config(data)
     if config.passphrase is not None:
         _repair_permissions(path)
@@ -190,7 +227,7 @@ def run_wizard(profile: str | None = None) -> Config:
     console.print(f"No config found at [dim]{path}[/]. Let's set one up.\n")
 
     host = Prompt.ask("SSH host", default="dubstep.cleannameservers.com")
-    port = int(Prompt.ask("SSH port", default="50288"))
+    port = IntPrompt.ask("SSH port", default=50288)
     user = Prompt.ask("SSH user", default="dylanspa")
     key_path = Prompt.ask(
         "Path to SSH private key",

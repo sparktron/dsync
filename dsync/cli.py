@@ -20,9 +20,13 @@ from .log import append_log, read_log
 from .ssh import SSHManager
 from .state import StateManager, _matches_ignore
 from .sync import (
+    SyncError,
     backup_remote_files,
     create_full_backup,
+    delete_backups,
     file_to_url,
+    find_old_backups,
+    is_safe_rel_path,
     push_single_file,
     rsync_pull,
     rsync_push_all,
@@ -34,6 +38,23 @@ from .sync import (
 from .watcher import FileWatcher
 
 console = Console()
+
+
+def _to_rel_path(config, path: str) -> str:
+    """Map a CLI path argument to a path relative to local_root.
+
+    Accepts a path relative to local_root, or any path (absolute or relative
+    to the cwd) that resolves to somewhere under local_root.
+    """
+    root = config.local_root.resolve()
+    abs_path = Path(path).expanduser().resolve()
+    if abs_path.exists():
+        try:
+            rel = abs_path.relative_to(root).as_posix()
+            return "" if rel == "." else rel
+        except ValueError:
+            pass  # not under local_root; fall back to treating it as relative
+    return path.lstrip("/")
 
 
 @click.group()
@@ -72,16 +93,30 @@ def pull(ctx: click.Context) -> None:
         return
 
     t0 = time.monotonic()
-    with SSHManager(config, profile=profile) as ssh:  # noqa: F841  (establishes connection + verifies auth)
-        rsync_pull(config, state)
+    try:
+        with SSHManager(config, profile=profile) as ssh:  # noqa: F841  (establishes connection + verifies auth)
+            pulled = rsync_pull(config, state)
+    except SyncError as exc:
+        _log_failure("pull", [], t0, profile)
+        raise click.ClickException(str(exc)) from exc
     append_log(
         "pull",
-        [],
+        pulled,
         ok=True,
         duration_ms=int((time.monotonic() - t0) * 1000),
         profile=profile,
     )
     run_hook(config, "post_pull")
+
+
+def _log_failure(action: str, files: list[str], t0: float, profile: str | None) -> None:
+    append_log(
+        action,
+        files,
+        ok=False,
+        duration_ms=int((time.monotonic() - t0) * 1000),
+        profile=profile,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -111,64 +146,62 @@ def push(ctx: click.Context, path: str | None, show_diff: bool) -> None:
         return
 
     t0 = time.monotonic()
-    deployed = False
-    with SSHManager(config, profile=profile) as ssh:
-        if path:
-            deployed = _push_path(ssh, config, state, path)
-            append_log(
-                "push",
-                [path],
-                ok=deployed,
-                duration_ms=int((time.monotonic() - t0) * 1000),
-                profile=profile,
-            )
-        else:
-            transferred = _push_all_interactive(ssh, config, state, show_diff=show_diff)
-            deployed = len(transferred) > 0
-            append_log(
-                "push",
-                transferred,
-                ok=deployed,
-                duration_ms=int((time.monotonic() - t0) * 1000),
-                profile=profile,
-            )
-    if deployed:
+    try:
+        with SSHManager(config, profile=profile) as ssh:
+            if path:
+                transferred = _push_path(ssh, config, state, path)
+            else:
+                transferred = _push_all_interactive(
+                    ssh, config, state, show_diff=show_diff
+                )
+    except SyncError as exc:
+        _log_failure("push", [path] if path else [], t0, profile)
+        raise click.ClickException(str(exc)) from exc
+
+    # A run with nothing to push (or a declined prompt) is not a failure, but
+    # it is not worth an audit-log entry or a post_push hook either.
+    if transferred:
+        append_log(
+            "push",
+            transferred,
+            ok=True,
+            duration_ms=int((time.monotonic() - t0) * 1000),
+            profile=profile,
+        )
         run_hook(config, "post_push")
 
 
-def _push_path(ssh: SSHManager, config, state: StateManager, path: str) -> bool:
-    """Push a specific file or directory. Returns True if files were deployed."""
-    rel_path = path.lstrip("/")
+def _push_path(ssh: SSHManager, config, state: StateManager, path: str) -> list[str]:
+    """Push a specific file or directory. Returns the files deployed.
 
-    # Allow both absolute local paths and paths relative to local_root.
-    abs_path = Path(path).expanduser().resolve()
-    if abs_path.exists():
-        try:
-            rel_path = str(abs_path.relative_to(config.local_root))
-        except ValueError:
-            pass  # not under local_root, use as-is
+    Raises SyncError if the path is invalid or the transfer fails.
+    """
+    rel_path = _to_rel_path(config, path)
+    if rel_path == "":
+        raise SyncError("That is the site root — run `dsync push` with no path.")
+    if not is_safe_rel_path(rel_path):
+        raise SyncError(f"Path is outside the site root: {path}")
 
     local_path = config.local_root / rel_path
     if not local_path.exists():
-        console.print(f"[red]✗[/] Path not found: {local_path}")
-        return False
+        raise SyncError(f"Path not found: {local_path}")
 
     if local_path.is_file():
         console.print("[blue]ℹ[/] Backing up remote file...")
-        success = push_single_file(ssh, config, state, rel_path)
-        if success:
-            url = file_to_url(config, rel_path)
-            console.print(f"[green]✓[/] Done — {url}")
-        return success
-    else:
-        # Directory — use rsync for the subtree.
-        console.print(f"[blue]ℹ[/] Pushing directory: {rel_path}/")
-        transferred = rsync_push_directory(config, state, rel_path)
-        for f in transferred:
-            url = file_to_url(config, f)
-            console.print(f"  [green]✓[/] {f} → {url}")
-        console.print(f"\n[green]✓[/] {len(transferred)} file(s) pushed.")
-        return len(transferred) > 0
+        if not push_single_file(ssh, config, state, rel_path):
+            raise SyncError(f"Upload of {rel_path} failed")
+        url = file_to_url(config, rel_path)
+        console.print(f"[green]✓[/] Done — {url}")
+        return [rel_path]
+
+    # Directory — use rsync for the subtree.
+    console.print(f"[blue]ℹ[/] Pushing directory: {rel_path}/")
+    transferred = rsync_push_directory(config, state, rel_path)
+    for f in transferred:
+        url = file_to_url(config, f)
+        console.print(f"  [green]✓[/] {f} → {url}")
+    console.print(f"\n[green]✓[/] {len(transferred)} file(s) pushed.")
+    return transferred
 
 
 def _push_all_interactive(
@@ -194,10 +227,23 @@ def _push_all_interactive(
 
     console.print("[blue]ℹ[/] Creating server backup of changed files...")
     try:
-        backup_dir = backup_remote_files(ssh, config, changed)
-        console.print(f"[green]✓[/] Backup at {backup_dir}")
+        backup_dir, failed = backup_remote_files(ssh, config, changed)
     except Exception as e:
-        console.print(f"[yellow]⚠[/] Backup failed (continuing): {e}")
+        console.print(f"[yellow]⚠[/] Backup failed: {e}")
+        if not click.confirm("Push without a backup?", default=False):
+            return []
+    else:
+        if failed:
+            console.print(
+                f"[yellow]⚠[/] Backup at {backup_dir} is missing "
+                f"{len(failed)} file(s) that could not be copied:"
+            )
+            for f in failed:
+                console.print(f"  [yellow]{f}[/]")
+            if not click.confirm("Push anyway?", default=False):
+                return []
+        else:
+            console.print(f"[green]✓[/] Backup at {backup_dir}")
 
     transferred = rsync_push_all(config, state)
     console.print()
@@ -373,8 +419,11 @@ def status(ctx: click.Context, local_only: bool) -> None:
 
     console.print("[blue]ℹ[/] Comparing local vs remote (this may take a moment)...")
 
-    with SSHManager(config, profile=profile) as ssh:
-        groups = rsync_status(config, ssh)
+    try:
+        with SSHManager(config, profile=profile) as ssh:
+            groups = rsync_status(config, ssh)
+    except SyncError as exc:
+        raise click.ClickException(str(exc)) from exc
 
     total = sum(len(v) for v in groups.values())
     if total == 0:
@@ -460,16 +509,71 @@ def _status_local(config, state: StateManager) -> None:
 @cli.command()
 @click.pass_context
 def backup(ctx: click.Context) -> None:
-    """Trigger a full server-side backup to ~/backups/dsync/."""
+    """Create a full tar.gz backup of the site in the remote backup_dir."""
     profile = ctx.obj["profile"]
     config = load_config(profile=profile)
     t0 = time.monotonic()
-    with SSHManager(config, profile=profile) as ssh:
-        backup_path = create_full_backup(ssh, config)
-        console.print(f"[green]✓[/] Backup created: {backup_path}")
+    try:
+        with SSHManager(config, profile=profile) as ssh:
+            backup_path = create_full_backup(ssh, config)
+            console.print(f"[green]✓[/] Backup created: {backup_path}")
+    except RuntimeError as exc:
+        _log_failure("backup", [], t0, profile)
+        raise click.ClickException(str(exc)) from exc
     append_log(
         "backup",
         [],
+        ok=True,
+        duration_ms=int((time.monotonic() - t0) * 1000),
+        profile=profile,
+    )
+
+
+@cli.command("prune-backups")
+@click.option(
+    "--days",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Delete backups older than this many days "
+    "(default: backup_keep_days from config).",
+)
+@click.option("--yes", "-y", is_flag=True, help="Delete without confirming.")
+@click.pass_context
+def prune_backups(ctx: click.Context, days: int | None, yes: bool) -> None:
+    """Delete old dsync backups from the remote backup_dir.
+
+    Only entries dsync itself created (timestamp-named directories and
+    archives) are considered; anything else in that directory is left alone.
+    """
+    profile = ctx.obj["profile"]
+    config = load_config(profile=profile)
+    if days is None:
+        days = config.backup_keep_days
+    if days is None:
+        raise click.UsageError("Pass --days N, or set backup_keep_days in the config.")
+
+    t0 = time.monotonic()
+    try:
+        with SSHManager(config, profile=profile) as ssh:
+            old = find_old_backups(ssh, config, days)
+            if not old:
+                console.print(f"[green]✓[/] No backups older than {days} day(s).")
+                return
+            console.print(f"[bold]Backups older than {days} day(s)[/] ({len(old)}):")
+            for p in old:
+                console.print(f"  [red]{p}[/]")
+            if not yes and not click.confirm(
+                f"\nPermanently delete {len(old)} backup(s)?", default=False
+            ):
+                return
+            delete_backups(ssh, old)
+    except RuntimeError as exc:
+        _log_failure("prune", [], t0, profile)
+        raise click.ClickException(str(exc)) from exc
+    console.print(f"[green]✓[/] Deleted {len(old)} backup(s).")
+    append_log(
+        "prune",
+        old,
         ok=True,
         duration_ms=int((time.monotonic() - t0) * 1000),
         profile=profile,
@@ -490,15 +594,7 @@ def open_url(ctx: click.Context, path: str | None) -> None:
     config = load_config(profile=profile)
 
     if path:
-        rel_path = path.lstrip("/")
-        # Allow absolute paths under local_root.
-        abs_path = Path(path).expanduser().resolve()
-        if abs_path.exists():
-            try:
-                rel_path = str(abs_path.relative_to(config.local_root))
-            except ValueError:
-                pass
-        url = file_to_url(config, rel_path)
+        url = file_to_url(config, _to_rel_path(config, path))
     else:
         url = config.site_url
 
