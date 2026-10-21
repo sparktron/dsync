@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import atexit
+import base64
+import hashlib
 import os
 import re
 import shlex
@@ -24,6 +27,72 @@ console = Console()
 _passphrase_cache: Optional[str] = None
 _passphrase_asked: bool = False
 _agent_env: dict[str, str] = {}
+
+# Upper bound on how long a key stays loaded in an agent dsync started.
+AGENT_KEY_LIFETIME_S = 3600
+
+KNOWN_HOSTS = Path.home() / ".ssh" / "known_hosts"
+
+
+def _kill_agent(agent_env: dict[str, str]) -> None:
+    """Stop an ssh-agent that dsync started (registered with atexit)."""
+    if "SSH_AGENT_PID" not in agent_env:
+        return
+    subprocess.run(
+        ["ssh-agent", "-k"],
+        env={**os.environ, **agent_env},
+        capture_output=True,
+        check=False,
+    )
+
+
+class _AcceptNewPolicy(paramiko.MissingHostKeyPolicy):
+    """Paramiko equivalent of OpenSSH's ``StrictHostKeyChecking=accept-new``.
+
+    A host with no known key is trusted on first contact and recorded in
+    ~/.ssh/known_hosts (shared with the ssh that rsync runs). A host whose key
+    *changed* never reaches this policy: paramiko raises BadHostKeyException.
+
+    Fails closed: if the key cannot be recorded, the connection is refused,
+    since an unwritable store would otherwise make every key "new".
+    """
+
+    def missing_host_key(
+        self, client: paramiko.SSHClient, hostname: str, key: paramiko.PKey
+    ) -> None:
+        try:
+            KNOWN_HOSTS.parent.mkdir(mode=0o700, exist_ok=True)
+            with KNOWN_HOSTS.open("a") as f:
+                f.write(f"{hostname} {key.get_name()} {key.get_base64()}\n")
+        except OSError as exc:
+            raise paramiko.SSHException(
+                f"Refusing unknown host {hostname}: could not record its key "
+                f"in {KNOWN_HOSTS}: {exc}"
+            ) from exc
+        client.get_host_keys().add(hostname, key.get_name(), key)
+        digest = base64.b64encode(hashlib.sha256(key.asbytes()).digest())
+        fingerprint = "SHA256:" + digest.decode().rstrip("=")
+        console.print(
+            f"[yellow]⚠[/] New host key for {hostname} "
+            f"({key.get_name()} {fingerprint}) — added to {KNOWN_HOSTS}"
+        )
+
+
+def _load_known_hosts(client: paramiko.SSHClient) -> None:
+    """Load ~/.ssh/known_hosts so a changed server key raises BadHostKeyException.
+
+    Passes the path explicitly: paramiko's no-argument form silently ignores
+    read errors, which would leave no keys loaded and let _AcceptNewPolicy
+    trust any key. Only a genuinely absent file (first use) is tolerated.
+    """
+    if not KNOWN_HOSTS.exists():
+        return
+    try:
+        client.load_system_host_keys(str(KNOWN_HOSTS))
+    except OSError as exc:
+        raise paramiko.SSHException(
+            f"Cannot read {KNOWN_HOSTS} to verify the server: {exc}"
+        ) from exc
 
 
 def get_passphrase(force_new: bool = False) -> Optional[str]:
@@ -102,6 +171,13 @@ def get_rsync_env(key_path: Path, config: Optional[Config] = None) -> dict[str, 
         # ssh-agent not available; rsync will fall back to interactive prompting.
         return dict(os.environ)
 
+    # This agent holds the decrypted key, so it must not outlive dsync.
+    atexit.register(_kill_agent, dict(new_env))
+
+    # -t bounds the key's lifetime in the agent even if the kill never runs
+    # (e.g. dsync is SIGKILLed).
+    add_cmd = ["ssh-add", "-t", str(AGENT_KEY_LIFETIME_S), str(key_path)]
+
     if passphrase:
         # Write a temporary askpass script that feeds the passphrase to ssh-add.
         with tempfile.NamedTemporaryFile(
@@ -119,8 +195,8 @@ def get_rsync_env(key_path: Path, config: Optional[Config] = None) -> dict[str, 
                 "SSH_ASKPASS_REQUIRE": "force",  # OpenSSH ≥ 8.4
                 "DISPLAY": os.environ.get("DISPLAY", ":0"),
             }
-            subprocess.run(
-                ["ssh-add", str(key_path)],
+            added = subprocess.run(
+                add_cmd,
                 env=add_env,
                 capture_output=True,
                 stdin=subprocess.DEVNULL,
@@ -133,12 +209,18 @@ def get_rsync_env(key_path: Path, config: Optional[Config] = None) -> dict[str, 
                 pass
     else:
         # Unencrypted key — no passphrase needed, so skip the askpass dance.
-        subprocess.run(
-            ["ssh-add", str(key_path)],
+        added = subprocess.run(
+            add_cmd,
             env={**os.environ, **new_env},
             capture_output=True,
             stdin=subprocess.DEVNULL,
             check=False,
+        )
+
+    if added.returncode != 0:
+        console.print(
+            "[yellow]⚠[/] Could not load the SSH key into ssh-agent "
+            "(wrong passphrase?). rsync may prompt for it directly."
         )
 
     _agent_env = new_env
@@ -175,6 +257,14 @@ class SSHManager:
             console.print("[green]✓[/] Connected")
             self._connection_succeeded = True
             self._offer_to_save_passphrase()
+        except paramiko.ssh_exception.BadHostKeyException as exc:
+            # Never retry or prompt through this: it is the MITM signal.
+            console.print(
+                f"[red]✗[/] Host key for {self.config.host} does not match "
+                f"{KNOWN_HOSTS}. If the server's key really changed, remove "
+                f"the old entry (ssh-keygen -R) and reconnect."
+            )
+            raise exc
         except paramiko.ssh_exception.AuthenticationException as exc:
             self._handle_auth_failure(exc, retry=retry)
         except (ValueError, paramiko.ssh_exception.SSHException) as exc:
@@ -249,16 +339,22 @@ class SSHManager:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _do_connect(self) -> None:
-        """Perform the actual paramiko connection."""
-        # Use stored passphrase if available, otherwise prompt
-        if self.config.passphrase is not None:
+    def _do_connect(self, force_new_passphrase: bool = False) -> None:
+        """Perform the actual paramiko connection.
+
+        With *force_new_passphrase*, prompt afresh instead of using the cached
+        or stored passphrase (used after an authentication failure).
+        """
+        if force_new_passphrase:
+            passphrase = get_passphrase(force_new=True)
+        elif self.config.passphrase is not None:
             passphrase = self.config.passphrase
         else:
             passphrase = get_passphrase()
 
         client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        _load_known_hosts(client)
+        client.set_missing_host_key_policy(_AcceptNewPolicy())
         client.connect(
             hostname=self.config.host,
             port=self.config.port,
@@ -357,21 +453,7 @@ class SSHManager:
 
     def _do_connect_with_new_passphrase(self) -> None:
         """Connect with a fresh passphrase prompt, clearing the cache."""
-        # Force a new passphrase prompt
-        passphrase = get_passphrase(force_new=True)
-
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(
-            hostname=self.config.host,
-            port=self.config.port,
-            username=self.config.user,
-            key_filename=str(self.config.key_path),
-            passphrase=passphrase,
-            timeout=30,
-        )
-        self._client = client
-        self._sftp = None  # opened lazily
+        self._do_connect(force_new_passphrase=True)
 
     def _ensure_connected(self) -> None:
         """Reconnect if the transport is missing or dropped."""

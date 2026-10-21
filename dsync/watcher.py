@@ -49,6 +49,12 @@ class _DebouncedHandler(FileSystemEventHandler):
         if not event.is_directory:
             self._schedule(str(event.src_path))
 
+    def on_moved(self, event: FileSystemEvent) -> None:
+        # Editors that save atomically write a temp file and rename it over
+        # the original, so the real file only ever appears as a move target.
+        if not event.is_directory:
+            self._schedule(str(event.dest_path))
+
     def _schedule(self, abs_path: str) -> None:
         """Cancel any pending timer for this file and start a fresh one."""
         try:

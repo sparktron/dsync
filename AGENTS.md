@@ -18,7 +18,7 @@ locally, sync them up.
 |---|---|
 | `dsync/cli.py` | Click entry point — `dsync = "dsync.cli:cli"` |
 | `dsync/sync.py` | rsync invocation and transfer logic |
-| `dsync/ssh.py` | paramiko/SFTP transport; the only module with tests |
+| `dsync/ssh.py` | paramiko/SFTP transport, ssh-agent setup for rsync |
 | `dsync/config.py` | Config loading |
 | `dsync/state.py` | Local sync state tracking |
 | `dsync/watcher.py` | watchdog-based file watching |
@@ -27,11 +27,11 @@ locally, sync them up.
 ## Commands
 
 ```bash
-pip install -e .          # editable install
+pip install -e '.[dev]'   # editable install + ruff + pytest
 dsync --help              # verify entry point resolves
 ruff check dsync/
 ruff format --check dsync/
-pytest                    # only tests/test_ssh.py exists today
+pytest
 ```
 
 ## CI
@@ -40,8 +40,8 @@ pytest                    # only tests/test_ssh.py exists today
 
 - **Lint** on Python 3.12 — `ruff check dsync/` and `ruff format --check dsync/`.
   Format check is enforced, so run `ruff format dsync/` before pushing.
-- **Build & Install** across Python **3.9, 3.10, 3.11, 3.12** — `pip install -e .`
-  then `dsync --help`.
+- **Build & Test** across Python **3.9, 3.10, 3.11, 3.12** — `pip install -e .`,
+  `dsync --help`, then `pytest`.
 
 `requires-python = ">=3.9"`. Do not use 3.10+ syntax (`match`, `X | Y` in
 annotations at runtime, `tomllib`) — the 3.9 matrix leg will fail.
@@ -57,8 +57,16 @@ This tool writes to a live public website over SSH. Treat every change to
 - Dry-run paths must stay genuinely side-effect-free. If you add a code path
   that writes, confirm it is gated behind the non-dry-run branch.
 
-## Testing gap
+- rsync failures raise `SyncError`; never turn a failed run into an empty
+  result, which callers read as "everything is in sync".
+- Host keys are verified against `~/.ssh/known_hosts` (`accept-new`) for both
+  rsync and paramiko. Do not reintroduce `StrictHostKeyChecking=no`.
+- `prune-backups` deletes only timestamp-named entries directly under
+  `backup_dir`; keep that filter if you touch it.
 
-Only `ssh.py` has coverage. `sync.py` — the module that can delete remote
-files — has none. When touching `sync.py`, add tests rather than relying on
-manual verification against the live host.
+## Tests
+
+`tests/test_sync.py` covers `sync.py` with rsync and SSH stubbed out;
+`tests/test_ssh.py`, `tests/test_config.py` and `tests/test_misc.py` cover the
+rest. When touching `sync.py`, add tests rather than relying on manual
+verification against the live host.

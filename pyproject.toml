@@ -20,6 +20,7 @@ dsync = "dsync.cli:cli"
 [project.optional-dependencies]
 dev = [
     "ruff==0.16.5",
+    "pytest>=7",
 ]
 
 [tool.setuptools.packages.find]
