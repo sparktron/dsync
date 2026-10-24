@@ -3,108 +3,24 @@
 from __future__ import annotations
 
 import posixpath
+import re
 import shlex
 import subprocess
-from datetime import datetime
-from pathlib import Path
+from datetime import datetime, timezone
+from typing import Optional
 
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from .config import Config
 from .ssh import SSHManager, get_rsync_env
-from .state import StateManager
+from .state import StateManager, _matches_ignore
 
 console = Console()
 
 
-# ---------------------------------------------------------------------------
-# Errors
-# ---------------------------------------------------------------------------
-
-
-class RsyncError(RuntimeError):
-    """An rsync invocation failed hard enough that its output means nothing."""
-
-    def __init__(self, action: str, returncode: int | None, stderr: str = "") -> None:
-        self.action = action
-        self.returncode = returncode
-        self.stderr = stderr.strip()
-        code = f" (rsync exit {returncode})" if returncode is not None else ""
-        detail = f"\n{self.stderr}" if self.stderr else ""
-        super().__init__(f"{action} failed{code}{detail}")
-
-
-class PathOutsideRoot(ValueError):
-    """A path resolved outside the configured local or remote root."""
-
-
-# ---------------------------------------------------------------------------
-# Path confinement
-#
-# Everything dsync writes must land under remote_root, and everything it reads
-# must come from under local_root. `lstrip("/")` does not strip `..`, so without
-# these a mistyped `dsync push ../secrets.env` uploaded a file from outside the
-# project to outside the web root, with no confirmation.
-# ---------------------------------------------------------------------------
-
-
-def _within(path: Path, root: Path) -> bool:
-    """True if *path* is *root* or sits underneath it."""
-    try:
-        path.relative_to(root)
-    except ValueError:
-        return False
-    return True
-
-
-def relative_to_root(config: Config, path: str) -> str:
-    """Resolve a user-supplied path to a POSIX path relative to local_root.
-
-    Accepts an absolute filesystem path, a path relative to local_root, a path
-    relative to the current directory, or a leading-slash site path such as
-    ``/aboutme/index.html``. Raises PathOutsideRoot if the result would fall
-    outside local_root.
-    """
-    root = config.local_root
-    candidate = Path(path).expanduser()
-
-    if candidate.is_absolute():
-        resolved = candidate.resolve()
-        if not _within(resolved, root) and not resolved.exists():
-            # A leading slash can also mean "relative to the site root", the way
-            # a URL path does: `dsync open /aboutme/index.html`. Only fall back
-            # to that reading when no such file exists on disk — if it does, the
-            # user meant that file, and it belongs to a different project.
-            resolved = (root / candidate.relative_to(candidate.anchor)).resolve()
-    else:
-        # Read against local_root first, so `dsync push css/style.css` works from
-        # any directory; fall back to a cwd-relative reading only if that is the
-        # one that exists.
-        from_root = (root / candidate).resolve()
-        from_cwd = (Path.cwd() / candidate).resolve()
-        resolved = from_root
-        if not from_root.exists() and from_cwd.exists():
-            resolved = from_cwd
-
-    if not _within(resolved, root):
-        raise PathOutsideRoot(
-            f"{path!r} resolves to {resolved}, which is outside the project root {root}"
-        )
-
-    rel = resolved.relative_to(root)
-    return "" if rel == Path(".") else rel.as_posix()
-
-
-def remote_path_for(config: Config, rel_path: str) -> str:
-    """Join a root-relative path onto remote_root, refusing to escape it."""
-    root = config.remote_root  # normalised by Config to end in "/"
-    joined = posixpath.normpath(root + rel_path)
-    if joined != root.rstrip("/") and not joined.startswith(root):
-        raise PathOutsideRoot(
-            f"{rel_path!r} resolves to {joined}, which is outside the remote root {root}"
-        )
-    return joined
+class SyncError(RuntimeError):
+    """An rsync or remote operation failed; the message is user-facing."""
 
 
 # ---------------------------------------------------------------------------
@@ -113,14 +29,28 @@ def remote_path_for(config: Config, rel_path: str) -> str:
 
 
 def _ssh_cmd(config: Config) -> str:
-    """Build the SSH command string used by rsync's -e flag."""
+    """Build the SSH command string used by rsync's -e flag.
+
+    Host keys are verified against ~/.ssh/known_hosts. An unknown host is
+    recorded on first contact (``accept-new``); a *changed* key is refused.
+    """
     return (
         f"ssh -p {config.port} "
         f"-i {shlex.quote(str(config.key_path))} "
-        f"-o StrictHostKeyChecking=no "
-        f"-o UserKnownHostsFile=/dev/null "
+        f"-o StrictHostKeyChecking=accept-new "
         f"-o LogLevel=ERROR"
     )
+
+
+def is_safe_rel_path(rel_path: str) -> bool:
+    """True if *rel_path* is relative and cannot climb out of the site root.
+
+    Remote targets are built as ``remote_root + rel_path``, so a ``..`` or a
+    leading ``/`` here would write outside the web root.
+    """
+    if not rel_path or rel_path.startswith("/"):
+        return False
+    return ".." not in rel_path.split("/")
 
 
 def _exclude_flags(patterns: list[str]) -> list[str]:
@@ -135,13 +65,14 @@ def _run_rsync(
     config: Config,
     src: str,
     dst: str,
-    extra_flags: list[str] | None = None,
+    extra_flags: Optional[list[str]] = None,
     dry_run: bool = False,
     capture: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     """Run an rsync command, returning the CompletedProcess result."""
     cmd = (
-        ["rsync", "-az", "--checksum", "--itemize-changes"]
+        # --protect-args keeps paths with spaces intact on the remote side.
+        ["rsync", "-az", "--checksum", "--itemize-changes", "--protect-args"]
         + (["--dry-run"] if dry_run else [])
         + (extra_flags or [])
         + ["-e", _ssh_cmd(config)]
@@ -149,41 +80,23 @@ def _run_rsync(
         + [src, dst]
     )
     env = get_rsync_env(config.key_path, config=config)
-    try:
-        return subprocess.run(
-            cmd,
-            capture_output=capture,
-            text=True,
-            env=env,
+    return subprocess.run(
+        cmd,
+        capture_output=capture,
+        text=True,
+        env=env,
+        check=False,
+    )
+
+
+def _check_rsync(result: subprocess.CompletedProcess[str], what: str) -> None:
+    """Raise SyncError if an rsync run failed."""
+    if result.returncode != 0:
+        detail = (result.stderr or "").strip()
+        raise SyncError(
+            f"{what} failed (rsync exit {result.returncode})"
+            + (f":\n{detail}" if detail else "")
         )
-    except FileNotFoundError as exc:
-        raise RsyncError(
-            "Running rsync", None, "rsync is not installed or not on PATH"
-        ) from exc
-
-
-# rsync still produces usable output when some files could not be transferred
-# (23) or vanished mid-scan (24). Every other non-zero exit means the run tells
-# us nothing — and empty output must never be mistaken for "no differences".
-_RSYNC_PARTIAL_CODES = (23, 24)
-
-
-def _check_rsync(result: subprocess.CompletedProcess[str], action: str) -> bool:
-    """Raise RsyncError unless the run is usable. Returns True if it was partial.
-
-    Callers must route every rsync result through this. Treating a failed run as
-    an empty result is what let `dsync status` report "everything is in sync"
-    when the comparison never actually happened.
-    """
-    if result.returncode == 0:
-        return False
-    if result.returncode in _RSYNC_PARTIAL_CODES:
-        console.print(
-            f"[yellow]⚠[/] {action}: rsync reported a partial run "
-            f"(exit {result.returncode}); results may be incomplete."
-        )
-        return True
-    raise RsyncError(action, result.returncode, result.stderr or "")
 
 
 # ---------------------------------------------------------------------------
@@ -221,8 +134,11 @@ def _parse_itemize(output: str) -> tuple[list[str], list[str]]:
 # ---------------------------------------------------------------------------
 
 
-def rsync_pull(config: Config, state: StateManager) -> None:
-    """Pull the full site from the server to local using rsync."""
+def rsync_pull(config: Config, state: StateManager) -> list[str]:
+    """Pull the full site from the server to local using rsync.
+
+    Returns the files that were updated. Raises SyncError if rsync fails.
+    """
     remote_src = f"{config.user}@{config.host}:{config.remote_root}"
     local_dst = str(config.local_root) + "/"
 
@@ -237,14 +153,16 @@ def rsync_pull(config: Config, state: StateManager) -> None:
 
     _check_rsync(result, "Pull")
 
-    # Pull runs without --delete, so rsync never reports deletions here.
-    transfers, _ = _parse_itemize(result.stdout)
+    transfers, deletions = _parse_itemize(result.stdout)
     for f in transfers:
         console.print(f"  [green]↓[/] {f}")
-    console.print(f"\n[green]✓[/] {len(transfers)} updated")
+    for f in deletions:
+        console.print(f"  [red]✗[/] deleted locally: {f}")
+    console.print(f"\n[green]✓[/] {len(transfers)} updated, {len(deletions)} deleted")
 
     state.scan_directory(config.local_root, config.ignore_patterns)
     state.save()
+    return transfers
 
 
 # ---------------------------------------------------------------------------
@@ -255,7 +173,8 @@ def rsync_pull(config: Config, state: StateManager) -> None:
 def rsync_push_dry_run(config: Config) -> list[str]:
     """
     Dry-run rsync from local to remote.
-    Returns the list of file paths that would be transferred.
+    Returns the list of file paths that would be transferred. Raises
+    SyncError if rsync fails -- an empty list always means "nothing to push".
     """
     local_src = str(config.local_root) + "/"
     remote_dst = f"{config.user}@{config.host}:{config.remote_root}"
@@ -268,7 +187,7 @@ def rsync_push_dry_run(config: Config) -> list[str]:
 def rsync_push_all(config: Config, state: StateManager) -> list[str]:
     """
     Push all local changes to the server.
-    Returns the list of files that were transferred.
+    Returns the list of files that were transferred. Raises SyncError on failure.
     """
     local_src = str(config.local_root) + "/"
     remote_dst = f"{config.user}@{config.host}:{config.remote_root}"
@@ -294,17 +213,23 @@ def rsync_push_directory(
 ) -> list[str]:
     """
     Push a local subdirectory to the server.
-    Returns the list of files transferred.
+    Returns the list of files transferred. Raises SyncError on failure.
     """
+    if not is_safe_rel_path(rel_dir):
+        raise SyncError(f"Refusing path outside the site root: {rel_dir}")
     local_src = str(config.local_root / rel_dir) + "/"
-    remote_dst = f"{config.user}@{config.host}:{remote_path_for(config, rel_dir)}/"
+    remote_dst = f"{config.user}@{config.host}:{config.remote_root}{rel_dir}/"
     result = _run_rsync(config, local_src, remote_dst)
     _check_rsync(result, f"Push of {rel_dir}/")
     transfers, _ = _parse_itemize(result.stdout)
     for local_file in (config.local_root / rel_dir).rglob("*"):
-        if local_file.is_file():
-            rel = str(local_file.relative_to(config.local_root))
-            state.update(rel, local_file)
+        if not local_file.is_file():
+            continue
+        rel = local_file.relative_to(config.local_root).as_posix()
+        # Match scan_directory: ignored files are never synced, so never tracked.
+        if _matches_ignore(rel, config.ignore_patterns):
+            continue
+        state.update(rel, local_file)
     state.save()
     return [f"{rel_dir}/{f}" for f in transfers]
 
@@ -325,12 +250,15 @@ def push_single_file(
 
     Creates a remote backup first. Returns True on success.
     """
+    if not is_safe_rel_path(rel_path):
+        console.print(f"[red]✗[/] Refusing path outside the site root: {rel_path}")
+        return False
     local_path = config.local_root / rel_path
     if not local_path.exists():
         console.print(f"[red]✗[/] Local file not found: {local_path}")
         return False
 
-    remote_path = remote_path_for(config, rel_path)
+    remote_path = config.remote_root + rel_path
 
     # Backup the existing remote file.
     try:
@@ -339,22 +267,39 @@ def push_single_file(
         console.print(f"[yellow]⚠[/] Backup skipped: {e}")
 
     # Ensure the remote directory exists.
-    remote_dir = str(Path(remote_path).parent)
+    remote_dir = posixpath.dirname(remote_path)
     try:
         ssh.run(f"mkdir -p {shlex.quote(remote_dir)}")
     except Exception as e:
         console.print(f"[red]✗[/] Could not create remote directory: {e}")
         return False
 
-    # Upload via SFTP.
     try:
         ssh.sftp.put(str(local_path), remote_path)
-        state.update(rel_path, local_path)
-        state.save()
-        return True
     except Exception as e:
         console.print(f"[red]✗[/] Upload failed for {rel_path}: {e}")
         return False
+
+    # The file is live from here on, so nothing below may report failure
+    # (watch would retry, and the log would record a deploy that happened as
+    # failed).
+
+    # Carry the local mtime over as rsync -a would, so `status` can tell which
+    # side is newer. Some SFTP servers refuse SETSTAT; that is cosmetic.
+    try:
+        st = local_path.stat()
+        ssh.sftp.utime(remote_path, (st.st_atime, st.st_mtime))
+    except Exception as e:
+        console.print(f"[yellow]⚠[/] Uploaded {rel_path}, but could not set mtime: {e}")
+
+    try:
+        state.update(rel_path, local_path)
+        state.save()
+    except Exception as e:
+        console.print(
+            f"[yellow]⚠[/] Uploaded {rel_path}, but could not update sync state: {e}"
+        )
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -371,6 +316,9 @@ def rsync_status(config: Config, ssh: SSHManager) -> dict[str, list[str]]:
     - remote_newer: exists on both sides, differs, remote mtime is newer.
     - local_only:   exists locally, not on remote.
     - remote_only:  exists on remote, not locally.
+
+    Raises SyncError if either comparison fails, rather than reporting the
+    site as in sync.
     """
     local_src = str(config.local_root) + "/"
     remote = f"{config.user}@{config.host}:{config.remote_root}"
@@ -384,8 +332,6 @@ def rsync_status(config: Config, ssh: SSHManager) -> dict[str, list[str]]:
         config, remote, local_src, extra_flags=["--delete"], dry_run=True
     )
 
-    # Both probes must have actually run. Substituting empty output for a failed
-    # comparison makes a network or auth failure look identical to a clean tree.
     _check_rsync(push_result, "Status comparison (local → remote)")
     _check_rsync(pull_result, "Status comparison (remote → local)")
 
@@ -424,10 +370,10 @@ def _local_mtime(config: Config, rel_path: str) -> float:
         return 0.0
 
 
-def _remote_mtime(ssh: SSHManager, config: Config, rel_path: str) -> float | None:
+def _remote_mtime(ssh: SSHManager, config: Config, rel_path: str) -> Optional[float]:
     """Return the remote file's mtime via SFTP, or None if it can't be read."""
     try:
-        attr = ssh.sftp.stat(remote_path_for(config, rel_path))
+        attr = ssh.sftp.stat(config.remote_root + rel_path)
         return attr.st_mtime
     except Exception:
         return None
@@ -461,40 +407,55 @@ def _remote_backup_base(ssh: SSHManager, config: Config) -> str:
     return base
 
 
-def _backup_remote_file(ssh: SSHManager, config: Config, rel_path: str) -> None:
-    """Copy a single remote file to the timestamped backup directory."""
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    backup_base = _remote_backup_base(ssh, config)
-    safe_name = rel_path.replace("/", "_")
-    backup_path = f"{backup_base}/{timestamp}_{safe_name}"
-    remote_file = remote_path_for(config, rel_path)
-    ssh.run(f"mkdir -p {shlex.quote(backup_base)}")
-    ssh.run(
-        f"cp {shlex.quote(remote_file)} {shlex.quote(backup_path)} 2>/dev/null || true",
-        check=False,
+def _timestamp() -> str:
+    return datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d_%H-%M-%S")
+
+
+def _backup_cmd(src: str, dest: str) -> str:
+    """Shell command that copies *src* to *dest*, mirroring its directory.
+
+    A missing *src* is a new file with nothing to back up, so that case exits
+    0. A *dest* that already exists (two saves within one second) is kept, so
+    the oldest version wins. Any other failure exits non-zero.
+    """
+    q_src, q_dest = shlex.quote(src), shlex.quote(dest)
+    q_dir = shlex.quote(posixpath.dirname(dest))
+    return (
+        f"if [ -e {q_src} ] && [ ! -e {q_dest} ]; then "
+        f"mkdir -p {q_dir} && cp -p {q_src} {q_dest}; fi"
     )
 
 
-def backup_remote_files(ssh: SSHManager, config: Config, rel_paths: list[str]) -> str:
+def _backup_remote_file(ssh: SSHManager, config: Config, rel_path: str) -> None:
+    """Copy a single remote file into a timestamped backup directory.
+
+    Raises RuntimeError if the copy fails.
+    """
+    backup_dir = f"{_remote_backup_base(ssh, config)}/{_timestamp()}"
+    ssh.run(_backup_cmd(config.remote_root + rel_path, f"{backup_dir}/{rel_path}"))
+
+
+def backup_remote_files(
+    ssh: SSHManager, config: Config, rel_paths: list[str]
+) -> tuple[str, list[str]]:
     """
     Back up a specific set of remote files before overwriting them.
 
-    Creates a timestamped directory under the remote backup base and
-    copies each file there. Returns the backup directory path.
+    Copies each file into a timestamped directory under the remote backup
+    base, preserving its relative path. Returns ``(backup_dir, failed)``
+    where *failed* lists the files that could not be backed up.
     """
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    backup_base = _remote_backup_base(ssh, config)
-    backup_dir = f"{backup_base}/{timestamp}"
+    backup_dir = f"{_remote_backup_base(ssh, config)}/{_timestamp()}"
     ssh.run(f"mkdir -p {shlex.quote(backup_dir)}")
+    failed: list[str] = []
     for rel_path in rel_paths:
-        remote_file = remote_path_for(config, rel_path)
-        safe_name = rel_path.replace("/", "_")
-        dest = f"{backup_dir}/{safe_name}"
-        ssh.run(
-            f"cp {shlex.quote(remote_file)} {shlex.quote(dest)} 2>/dev/null || true",
-            check=False,
-        )
-    return backup_dir
+        try:
+            ssh.run(
+                _backup_cmd(config.remote_root + rel_path, f"{backup_dir}/{rel_path}")
+            )
+        except RuntimeError:
+            failed.append(rel_path)
+    return backup_dir, failed
 
 
 def create_full_backup(ssh: SSHManager, config: Config) -> str:
@@ -504,15 +465,56 @@ def create_full_backup(ssh: SSHManager, config: Config) -> str:
     Stores the archive under the remote backup directory with a
     timestamp in the filename. Returns the remote path of the archive.
     """
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     backup_base = _remote_backup_base(ssh, config)
-    backup_path = f"{backup_base}/{timestamp}.tar.gz"
+    backup_path = f"{backup_base}/{_timestamp()}.tar.gz"
     ssh.run(f"mkdir -p {shlex.quote(backup_base)}")
     console.print("[blue]ℹ[/] Archiving remote site (this may take a moment)...")
     ssh.run(
         f"tar -czf {shlex.quote(backup_path)} -C {shlex.quote(config.remote_root)} ."
     )
     return backup_path
+
+
+# Names dsync gives top-level entries in the backup dir: a timestamped directory
+# (per-push and per-save backups), a full-site ``<timestamp>.tar.gz``, or a
+# ``<timestamp>_<name>`` file from versions before per-save backups mirrored
+# the tree. Pruning only ever touches entries matching this.
+_BACKUP_NAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(\.tar\.gz|_.+)?$")
+
+
+def find_old_backups(ssh: SSHManager, config: Config, keep_days: int) -> list[str]:
+    """List dsync backups in the remote backup dir older than *keep_days* days.
+
+    Only top-level entries whose names match dsync's timestamp format are
+    returned, so nothing else that happens to live in that directory is
+    ever a candidate for deletion.
+    """
+    if keep_days < 1:
+        raise SyncError("Backup retention must be at least 1 day.")
+    base = posixpath.normpath(_remote_backup_base(ssh, config))
+    if base in ("/", "."):
+        raise SyncError(f"Refusing to prune backups in {base!r}.")
+    q_base = shlex.quote(base)
+    out, _ = ssh.run(
+        f"[ -d {q_base} ] || exit 0; "
+        f"find {q_base} -mindepth 1 -maxdepth 1 -mtime +{int(keep_days)} -print"
+    )
+    old: list[str] = []
+    for line in out.splitlines():
+        path = line.strip()
+        if posixpath.dirname(path) == base and _BACKUP_NAME_RE.match(
+            posixpath.basename(path)
+        ):
+            old.append(path)
+    return sorted(old)
+
+
+def delete_backups(ssh: SSHManager, paths: list[str]) -> None:
+    """Delete backup entries previously returned by find_old_backups."""
+    for path in paths:
+        if not _BACKUP_NAME_RE.match(posixpath.basename(path)):
+            raise SyncError(f"Refusing to delete non-backup path: {path}")
+        ssh.run(f"rm -rf -- {shlex.quote(path)}")
 
 
 # ---------------------------------------------------------------------------
@@ -537,6 +539,7 @@ def run_hook(config: Config, hook: str) -> bool:
         shell=True,
         cwd=str(config.local_root),
         text=True,
+        check=False,
     )
     if result.returncode != 0:
         console.print(

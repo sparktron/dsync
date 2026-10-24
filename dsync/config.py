@@ -4,17 +4,25 @@ from __future__ import annotations
 
 import json
 import os
+import stat
+import tempfile
 from pathlib import Path
 from typing import Any
 
+import click
 from rich.console import Console
-from rich.prompt import Confirm, Prompt
+from rich.prompt import IntPrompt, Prompt
 
 console = Console()
 
 CONFIG_DIR = Path.home() / ".dsync"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 PROFILES_DIR = CONFIG_DIR / "profiles"
+
+# The config may hold the SSH key passphrase, so it gets the same treatment as
+# the private key it unlocks: owner-only, and never group- or world-readable.
+DIR_MODE = 0o700
+FILE_MODE = 0o600
 
 DEFAULT_IGNORE: list[str] = [
     ".git/",
@@ -30,28 +38,50 @@ DEFAULT_IGNORE: list[str] = [
 ]
 
 
+REQUIRED_KEYS = (
+    "host",
+    "port",
+    "user",
+    "key_path",
+    "local_root",
+    "remote_root",
+    "site_url",
+)
+
+
+class ConfigError(click.ClickException):
+    """The config file is missing, malformed, or incomplete."""
+
+
 class Config:
     """Holds all dsync configuration values."""
 
     def __init__(self, data: dict[str, Any]) -> None:
+        missing = [k for k in REQUIRED_KEYS if k not in data]
+        if missing:
+            raise ConfigError(
+                f"Config is missing required key(s): {', '.join(missing)}"
+            )
+        try:
+            self.port: int = int(data["port"])
+        except (TypeError, ValueError):
+            raise ConfigError(
+                f"Config 'port' must be a number, got {data['port']!r}"
+            ) from None
         self.host: str = data["host"]
-        self.port: int = int(data["port"])
         self.user: str = data["user"]
         self.key_path: Path = Path(data["key_path"]).expanduser()
-        # Resolved, not merely expanded: every path comparison in the tool comes
-        # from Path.resolve(), so an unresolved root with a symlink component
-        # made relative_to() fail for files that genuinely are in the project.
-        self.local_root: Path = Path(data["local_root"]).expanduser().resolve()
+        self.local_root: Path = Path(data["local_root"]).expanduser()
         self.remote_root: str = data["remote_root"].rstrip("/") + "/"
         self.site_url: str = data["site_url"].rstrip("/")
         self.backup_dir: str = data.get("backup_dir", "~/backups/dsync")
-        self.ignore_patterns: list[str] = data.get("ignore_patterns", DEFAULT_IGNORE)
+        self.ignore_patterns: list[str] = list(
+            data.get("ignore_patterns", DEFAULT_IGNORE)
+        )
         self.hooks: dict[str, str] = data.get("hooks", {})
-        # Legacy field: older versions stored the SSH key passphrase here in
-        # cleartext. It is still read so existing configs keep working, but it is
-        # never written back (see to_dict) and migrate_stored_passphrase removes
-        # it on first use.
-        self.passphrase: str | None = data.get("passphrase")
+        self.passphrase: str | None = data.get("passphrase", None)
+        # Default retention for `dsync prune-backups`; None means "ask".
+        self.backup_keep_days: int | None = data.get("backup_keep_days")
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize config to a JSON-compatible dict."""
@@ -67,8 +97,10 @@ class Config:
             "ignore_patterns": self.ignore_patterns,
             "hooks": self.hooks,
         }
-        # The passphrase is deliberately not serialised — it belongs in the
-        # ssh-agent, not in a JSON file on disk.
+        if self.passphrase is not None:
+            data["passphrase"] = self.passphrase
+        if self.backup_keep_days is not None:
+            data["backup_keep_days"] = self.backup_keep_days
         return data
 
 
@@ -84,68 +116,96 @@ def _config_file(profile: str | None) -> Path:
     return PROFILES_DIR / f"{profile}.json"
 
 
+def _too_permissive(path: Path) -> int | None:
+    """Return the current mode if *path* is group/other-accessible, else None."""
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except OSError:
+        return None
+    return mode if mode & 0o077 else None
+
+
+def _ensure_private_dir(path: Path) -> None:
+    """Create *path* (and ~/.dsync above it) owner-only."""
+    for d in (CONFIG_DIR, path):
+        d.mkdir(parents=True, exist_ok=True, mode=DIR_MODE)
+        # mkdir's mode is masked by umask, and is ignored entirely when the
+        # directory already exists -- so set it explicitly.
+        if _too_permissive(d) is not None:
+            try:
+                d.chmod(DIR_MODE)
+            except OSError:
+                pass
+
+
+def _repair_permissions(path: Path) -> None:
+    """Tighten a config file that holds a passphrase but is readable by others.
+
+    Versions before this check wrote the file with the default umask, so an
+    existing install can have the passphrase sitting in a 0644 file.
+    """
+    mode = _too_permissive(path)
+    if mode is None:
+        return
+    try:
+        path.chmod(FILE_MODE)
+    except OSError:
+        console.print(
+            f"[yellow]⚠[/] {path} holds a saved passphrase and is readable by "
+            f"other users (mode {mode:04o}), and the permissions could not be "
+            f"changed. Fix it with: chmod 600 {path}"
+        )
+        return
+    console.print(
+        f"[yellow]⚠[/] {path} held a saved passphrase with mode {mode:04o} — "
+        f"tightened to 0600. Other accounts on this machine could have read it, "
+        f"so consider rotating the key passphrase."
+    )
+
+
 def load_config(profile: str | None = None) -> Config:
     """Load config from disk, running the first-run wizard if not found."""
     path = _config_file(profile)
     if not path.exists():
         return run_wizard(profile=profile)
-    with path.open() as f:
-        data = json.load(f)
+    try:
+        with path.open() as f:
+            data = json.load(f)
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"{path} is not valid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ConfigError(f"{path} must contain a JSON object")
     config = Config(data)
-    migrate_stored_passphrase(config, profile=profile)
+    if config.passphrase is not None:
+        _repair_permissions(path)
     return config
 
 
 def save_config(config: Config, profile: str | None = None) -> None:
-    """Persist config to disk, readable only by the owner."""
-    path = _config_file(profile)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _secure(path.parent, 0o700)
-    # os.open rather than Path.open: the mode must be set at creation time, or
-    # the file exists world-readable for the window before a chmod lands.
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        json.dump(config.to_dict(), f, indent=2)
-    _secure(path, 0o600)
+    """Persist config to disk, owner-readable only.
 
-
-def _secure(path: Path, mode: int) -> None:
-    """Best-effort tighten of an existing path's permissions."""
-    try:
-        if path.stat().st_mode & 0o777 != mode:
-            path.chmod(mode)
-    except OSError:
-        pass
-
-
-def migrate_stored_passphrase(config: Config, profile: str | None = None) -> None:
-    """Remove a cleartext passphrase left in an older config file.
-
-    Offers to hand the key to the ssh-agent first, so the migration does not
-    cost the user a prompt on every later command.
+    Written to a 0600 temp file in the destination directory and renamed into
+    place: writing in place would leave a window where a saved passphrase sits
+    in a file created under the caller's umask.
     """
-    if config.passphrase is None:
-        return
-
     path = _config_file(profile)
-    console.print(
-        f"[yellow]⚠[/] Your SSH key passphrase is stored in cleartext at [dim]{path}[/]."
-    )
-    console.print("   dsync no longer stores it — the ssh-agent holds it instead.")
-
-    from .ssh import load_key_into_agent
-
-    if Confirm.ask("   Load the key into your ssh-agent now?", default=True):
-        if load_key_into_agent(config.key_path, config.passphrase):
-            console.print("[green]✓[/] Key loaded into ssh-agent.")
-        else:
-            console.print(
-                "[yellow]⚠[/] Could not load it; you will be prompted when connecting."
-            )
-
-    config.passphrase = None
-    save_config(config, profile=profile)
-    console.print(f"[green]✓[/] Passphrase removed from {path} (now mode 0600).")
+    _ensure_private_dir(path.parent)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".config-", suffix=".tmp")
+    try:
+        os.fchmod(fd, FILE_MODE)
+        handle = os.fdopen(fd, "w")
+    except BaseException:
+        # fdopen did not take ownership of the descriptor, so close it here.
+        os.close(fd)
+        Path(tmp).unlink(missing_ok=True)
+        raise
+    try:
+        with handle as f:
+            json.dump(config.to_dict(), f, indent=2)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
 
 
 def list_profiles() -> list[str]:
@@ -167,7 +227,7 @@ def run_wizard(profile: str | None = None) -> Config:
     console.print(f"No config found at [dim]{path}[/]. Let's set one up.\n")
 
     host = Prompt.ask("SSH host", default="dubstep.cleannameservers.com")
-    port = int(Prompt.ask("SSH port", default="50288"))
+    port = IntPrompt.ask("SSH port", default=50288)
     user = Prompt.ask("SSH user", default="dylanspa")
     key_path = Prompt.ask(
         "Path to SSH private key",

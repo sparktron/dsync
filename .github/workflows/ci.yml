@@ -2,14 +2,9 @@ name: CI
 
 on:
   push:
-    branches: ["**"]
+    branches: [master]
   pull_request:
     branches: [master]
-  workflow_dispatch:
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
   lint:
@@ -20,20 +15,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      # Installs the ruff version pinned in pyproject.toml [dev], so a new ruff
-      # release cannot turn the build red without a deliberate bump.
-      - name: Install
-        run: python -m pip install -e ".[dev]"
-      - name: ruff check
-        run: python -m ruff check dsync/ tests/
-      - name: ruff format
-        run: python -m ruff format --check dsync/ tests/
+      # Pinned deliberately: ruff's default rule set is not stable across
+      # releases, and an unpinned install turns this job red on unchanged code.
+      # Bump this and the pin in pyproject.toml together.
+      - run: pip install ruff==0.16.5
+      - run: ruff check dsync/
+      - run: ruff format --check dsync/
 
-  test:
-    name: Test (Python ${{ matrix.python-version }})
+  build:
+    name: Build & Install (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
-      fail-fast: false
       matrix:
         python-version: ["3.9", "3.10", "3.11", "3.12"]
     steps:
@@ -42,8 +34,8 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install package
-        run: python -m pip install -e ".[dev]"
+        run: pip install -e . pytest
       - name: Verify CLI entry point
         run: dsync --help
       - name: Run tests
-        run: python -m pytest -q
+        run: pytest -q

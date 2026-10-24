@@ -7,7 +7,8 @@ import io
 import threading
 import time
 import webbrowser
-from datetime import datetime
+from datetime import datetime, timezone
+from pathlib import Path
 
 import click
 import paramiko
@@ -20,14 +21,14 @@ from .log import append_log, read_log
 from .ssh import SSHManager
 from .state import StateManager, _matches_ignore
 from .sync import (
-    PathOutsideRoot,
-    RsyncError,
+    SyncError,
     backup_remote_files,
     create_full_backup,
+    delete_backups,
     file_to_url,
+    find_old_backups,
+    is_safe_rel_path,
     push_single_file,
-    relative_to_root,
-    remote_path_for,
     rsync_pull,
     rsync_push_all,
     rsync_push_directory,
@@ -40,16 +41,28 @@ from .watcher import FileWatcher
 console = Console()
 
 
-# An operation can fail because rsync failed, or because the SSH connection never
-# came up at all — an unreachable host is the common case in practice. Both mean
-# "this did not run", and both should report cleanly and exit non-zero rather
-# than surfacing a paramiko traceback with no log entry.
-OPERATION_ERRORS = (RsyncError, PathOutsideRoot, paramiko.SSHException, OSError)
+def _to_rel_path(config, path: str) -> str:
+    """Map a CLI path argument to a path relative to local_root.
 
-
-def _ms(t0: float) -> int:
-    """Elapsed milliseconds since a time.monotonic() reading."""
-    return int((time.monotonic() - t0) * 1000)
+    Accepts a path relative to local_root, or any path (absolute or relative
+    to the cwd) that resolves to somewhere under local_root.
+    """
+    root = config.local_root.resolve()
+    candidate = Path(path).expanduser()
+    if candidate.is_absolute():
+        resolved = candidate.resolve()
+        if not resolved.exists() and not resolved.is_relative_to(root):
+            resolved = (root / path.lstrip("/")).resolve()
+    else:
+        resolved = (root / candidate).resolve()
+        cwd_path = candidate.resolve()
+        if not resolved.exists() and cwd_path.exists():
+            resolved = cwd_path
+    try:
+        rel = resolved.relative_to(root).as_posix()
+    except ValueError:
+        raise SyncError(f"Path is outside the site root: {path}") from None
+    return "" if rel == "." else rel
 
 
 @click.group()
@@ -90,14 +103,28 @@ def pull(ctx: click.Context) -> None:
     t0 = time.monotonic()
     try:
         with SSHManager(config, profile=profile) as ssh:  # noqa: F841  (establishes connection + verifies auth)
-            rsync_pull(config, state)
-    except OPERATION_ERRORS as exc:
-        console.print(f"[red]✗[/] Pull failed: {exc}")
-        append_log("pull", [], ok=False, duration_ms=_ms(t0), profile=profile)
-        raise SystemExit(1) from exc
-
-    append_log("pull", [], ok=True, duration_ms=_ms(t0), profile=profile)
+            pulled = rsync_pull(config, state)
+    except (SyncError, paramiko.SSHException, OSError) as exc:
+        _log_failure("pull", [], t0, profile)
+        raise click.ClickException(str(exc)) from exc
+    append_log(
+        "pull",
+        pulled,
+        ok=True,
+        duration_ms=int((time.monotonic() - t0) * 1000),
+        profile=profile,
+    )
     run_hook(config, "post_pull")
+
+
+def _log_failure(action: str, files: list[str], t0: float, profile: str | None) -> None:
+    append_log(
+        action,
+        files,
+        ok=False,
+        duration_ms=int((time.monotonic() - t0) * 1000),
+        profile=profile,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -128,73 +155,69 @@ def push(ctx: click.Context, path: str | None, show_diff: bool) -> None:
 
     t0 = time.monotonic()
     try:
-        # Resolve and confine the target before opening a connection, so a bad
-        # path fails immediately rather than after an SSH handshake.
-        rel_path = relative_to_root(config, path) if path is not None else None
+        if path:
+            _to_rel_path(config, path)
         with SSHManager(config, profile=profile) as ssh:
-            if rel_path is not None:
-                result = _push_path(ssh, config, state, rel_path)
+            if path:
+                transferred = _push_path(ssh, config, state, path)
             else:
-                result = _push_all_interactive(ssh, config, state, show_diff=show_diff)
-                if result is None:
-                    # Declined at the confirmation prompt — nothing was attempted,
-                    # so there is nothing to record.
-                    return
-    except OPERATION_ERRORS as exc:
-        console.print(f"[red]✗[/] Push failed: {exc}")
-        append_log("push", [], ok=False, duration_ms=_ms(t0), profile=profile)
-        raise SystemExit(1) from exc
+                transferred = _push_all_interactive(
+                    ssh, config, state, show_diff=show_diff
+                )
+    except (SyncError, paramiko.SSHException, OSError) as exc:
+        _log_failure("push", [path] if path else [], t0, profile)
+        raise click.ClickException(str(exc)) from exc
 
-    # An empty list means the tree was already in sync — a success with no work,
-    # not a failure. Only `None` (an upload that failed) is an unsuccessful push.
-    ok = result is not None
-    transferred = result or []
-    append_log("push", transferred, ok=ok, duration_ms=_ms(t0), profile=profile)
-
+    # A run with nothing to push (or a declined prompt) is not a failure, but
+    # it is not worth an audit-log entry or a post_push hook either.
     if transferred:
+        append_log(
+            "push",
+            transferred,
+            ok=True,
+            duration_ms=int((time.monotonic() - t0) * 1000),
+            profile=profile,
+        )
         run_hook(config, "post_push")
-    if not ok:
-        raise SystemExit(1)
 
 
-def _push_path(
-    ssh: SSHManager, config, state: StateManager, rel_path: str
-) -> list[str] | None:
-    """Push a file or directory named by a root-relative path.
+def _push_path(ssh: SSHManager, config, state: StateManager, path: str) -> list[str]:
+    """Push a specific file or directory. Returns the files deployed.
 
-    Returns the relative paths transferred, or None if the push failed.
-    An empty list means the target was already up to date.
+    Raises SyncError if the path is invalid or the transfer fails.
     """
+    rel_path = _to_rel_path(config, path)
+    if rel_path == "":
+        raise SyncError("That is the site root — run `dsync push` with no path.")
+    if not is_safe_rel_path(rel_path):
+        raise SyncError(f"Path is outside the site root: {path}")
+
     local_path = config.local_root / rel_path
     if not local_path.exists():
-        console.print(f"[red]✗[/] Path not found: {local_path}")
-        return None
+        raise SyncError(f"Path not found: {local_path}")
 
     if local_path.is_file():
         console.print("[blue]ℹ[/] Backing up remote file...")
         if not push_single_file(ssh, config, state, rel_path):
-            return None
+            raise SyncError(f"Upload of {rel_path} failed")
         url = file_to_url(config, rel_path)
         console.print(f"[green]✓[/] Done — {url}")
         return [rel_path]
-    else:
-        # Directory — use rsync for the subtree.
-        console.print(f"[blue]ℹ[/] Pushing directory: {rel_path}/")
-        transferred = rsync_push_directory(config, state, rel_path)
-        for f in transferred:
-            url = file_to_url(config, f)
-            console.print(f"  [green]✓[/] {f} → {url}")
-        console.print(f"\n[green]✓[/] {len(transferred)} file(s) pushed.")
-        return transferred
+
+    # Directory — use rsync for the subtree.
+    console.print(f"[blue]ℹ[/] Pushing directory: {rel_path}/")
+    transferred = rsync_push_directory(config, state, rel_path)
+    for f in transferred:
+        url = file_to_url(config, f)
+        console.print(f"  [green]✓[/] {f} → {url}")
+    console.print(f"\n[green]✓[/] {len(transferred)} file(s) pushed.")
+    return transferred
 
 
 def _push_all_interactive(
     ssh: SSHManager, config, state: StateManager, show_diff: bool = False
-) -> list[str] | None:
-    """Full push: diff → [show diff] → confirm → backup → sync.
-
-    Returns the transferred files, or None if the user declined at the prompt.
-    """
+) -> list[str]:
+    """Full push: diff → [show diff] → confirm → backup → sync. Returns transferred files."""
     console.print("[blue]ℹ[/] Computing changes...")
     changed = rsync_push_dry_run(config)
 
@@ -210,14 +233,27 @@ def _push_all_interactive(
         _show_push_diffs(ssh, config, changed)
 
     if not click.confirm(f"\nPush {len(changed)} file(s)?", default=True):
-        return None
+        return []
 
     console.print("[blue]ℹ[/] Creating server backup of changed files...")
     try:
-        backup_dir = backup_remote_files(ssh, config, changed)
-        console.print(f"[green]✓[/] Backup at {backup_dir}")
+        backup_dir, failed = backup_remote_files(ssh, config, changed)
     except Exception as e:
-        console.print(f"[yellow]⚠[/] Backup failed (continuing): {e}")
+        console.print(f"[yellow]⚠[/] Backup failed: {e}")
+        if not click.confirm("Push without a backup?", default=False):
+            return []
+    else:
+        if failed:
+            console.print(
+                f"[yellow]⚠[/] Backup at {backup_dir} is missing "
+                f"{len(failed)} file(s) that could not be copied:"
+            )
+            for f in failed:
+                console.print(f"  [yellow]{f}[/]")
+            if not click.confirm("Push anyway?", default=False):
+                return []
+        else:
+            console.print(f"[green]✓[/] Backup at {backup_dir}")
 
     transferred = rsync_push_all(config, state)
     console.print()
@@ -242,7 +278,7 @@ def _show_push_diffs(ssh: SSHManager, config, changed: list[str]) -> None:
             continue
         try:
             buf = io.BytesIO()
-            ssh.sftp.getfo(remote_path_for(config, rel_path), buf)
+            ssh.sftp.getfo(config.remote_root + rel_path, buf)
             remote_text = buf.getvalue().decode("utf-8", errors="replace")
         except Exception:
             remote_text = ""  # new file — show full content as addition
@@ -293,7 +329,7 @@ def watch(ctx: click.Context) -> None:
         with _upload_lock:
             success = push_single_file(ssh, config, state, rel_path)
         duration_ms = int((time.monotonic() - t0) * 1000)
-        timestamp = datetime.now().strftime("%H:%M:%S")
+        timestamp = datetime.now(timezone.utc).astimezone().strftime("%H:%M:%S")
         if success:
             with _retry_lock:
                 _retry_state.pop(rel_path, None)
@@ -396,9 +432,8 @@ def status(ctx: click.Context, local_only: bool) -> None:
     try:
         with SSHManager(config, profile=profile) as ssh:
             groups = rsync_status(config, ssh)
-    except OPERATION_ERRORS as exc:
-        console.print(f"[red]✗[/] Status failed: {exc}")
-        raise SystemExit(1) from exc
+    except (SyncError, paramiko.SSHException, OSError) as exc:
+        raise click.ClickException(str(exc)) from exc
 
     total = sum(len(v) for v in groups.values())
     if total == 0:
@@ -484,16 +519,71 @@ def _status_local(config, state: StateManager) -> None:
 @cli.command()
 @click.pass_context
 def backup(ctx: click.Context) -> None:
-    """Trigger a full server-side backup to ~/backups/dsync/."""
+    """Create a full tar.gz backup of the site in the remote backup_dir."""
     profile = ctx.obj["profile"]
     config = load_config(profile=profile)
     t0 = time.monotonic()
-    with SSHManager(config, profile=profile) as ssh:
-        backup_path = create_full_backup(ssh, config)
-        console.print(f"[green]✓[/] Backup created: {backup_path}")
+    try:
+        with SSHManager(config, profile=profile) as ssh:
+            backup_path = create_full_backup(ssh, config)
+            console.print(f"[green]✓[/] Backup created: {backup_path}")
+    except (RuntimeError, paramiko.SSHException, OSError) as exc:
+        _log_failure("backup", [], t0, profile)
+        raise click.ClickException(str(exc)) from exc
     append_log(
         "backup",
         [],
+        ok=True,
+        duration_ms=int((time.monotonic() - t0) * 1000),
+        profile=profile,
+    )
+
+
+@cli.command("prune-backups")
+@click.option(
+    "--days",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Delete backups older than this many days "
+    "(default: backup_keep_days from config).",
+)
+@click.option("--yes", "-y", is_flag=True, help="Delete without confirming.")
+@click.pass_context
+def prune_backups(ctx: click.Context, days: int | None, yes: bool) -> None:
+    """Delete old dsync backups from the remote backup_dir.
+
+    Only entries dsync itself created (timestamp-named directories and
+    archives) are considered; anything else in that directory is left alone.
+    """
+    profile = ctx.obj["profile"]
+    config = load_config(profile=profile)
+    if days is None:
+        days = config.backup_keep_days
+    if days is None:
+        raise click.UsageError("Pass --days N, or set backup_keep_days in the config.")
+
+    t0 = time.monotonic()
+    try:
+        with SSHManager(config, profile=profile) as ssh:
+            old = find_old_backups(ssh, config, days)
+            if not old:
+                console.print(f"[green]✓[/] No backups older than {days} day(s).")
+                return
+            console.print(f"[bold]Backups older than {days} day(s)[/] ({len(old)}):")
+            for p in old:
+                console.print(f"  [red]{p}[/]")
+            if not yes and not click.confirm(
+                f"\nPermanently delete {len(old)} backup(s)?", default=False
+            ):
+                return
+            delete_backups(ssh, old)
+    except (RuntimeError, paramiko.SSHException, OSError) as exc:
+        _log_failure("prune", [], t0, profile)
+        raise click.ClickException(str(exc)) from exc
+    console.print(f"[green]✓[/] Deleted {len(old)} backup(s).")
+    append_log(
+        "prune",
+        old,
         ok=True,
         duration_ms=int((time.monotonic() - t0) * 1000),
         profile=profile,
@@ -515,11 +605,9 @@ def open_url(ctx: click.Context, path: str | None) -> None:
 
     if path:
         try:
-            rel_path = relative_to_root(config, path)
-        except PathOutsideRoot as exc:
-            console.print(f"[red]✗[/] {exc}")
-            raise SystemExit(1) from exc
-        url = file_to_url(config, rel_path)
+            url = file_to_url(config, _to_rel_path(config, path))
+        except SyncError as exc:
+            raise click.ClickException(str(exc)) from exc
     else:
         url = config.site_url
 

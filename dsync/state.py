@@ -5,6 +5,8 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import json
+import os
+import tempfile
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -82,14 +84,26 @@ class StateManager:
                 self._state = {}
 
     def save(self) -> None:
-        """Persist state to disk."""
+        """Persist state to disk atomically (temp file + rename).
+
+        An interrupted write would otherwise leave truncated JSON, which
+        _load treats as corrupt and silently discards.
+        """
         self._state_file.parent.mkdir(parents=True, exist_ok=True)
-        with self._state_file.open("w") as f:
-            json.dump(
-                {path: entry.to_dict() for path, entry in self._state.items()},
-                f,
-                indent=2,
-            )
+        fd, tmp = tempfile.mkstemp(
+            dir=str(self._state_file.parent), prefix=".state-", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(
+                    {path: entry.to_dict() for path, entry in self._state.items()},
+                    f,
+                    indent=2,
+                )
+            os.replace(tmp, self._state_file)
+        except BaseException:
+            Path(tmp).unlink(missing_ok=True)
+            raise
 
     def update(self, rel_path: str, local_path: Path) -> None:
         """Record current mtime + checksum for a local file."""

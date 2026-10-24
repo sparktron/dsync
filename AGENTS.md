@@ -18,7 +18,7 @@ locally, sync them up.
 |---|---|
 | `dsync/cli.py` | Click entry point — `dsync = "dsync.cli:cli"` |
 | `dsync/sync.py` | rsync invocation and transfer logic |
-| `dsync/ssh.py` | paramiko/SFTP transport |
+| `dsync/ssh.py` | paramiko/SFTP transport, ssh-agent setup for rsync |
 | `dsync/config.py` | Config loading |
 | `dsync/state.py` | Local sync state tracking |
 | `dsync/watcher.py` | watchdog-based file watching |
@@ -27,28 +27,21 @@ locally, sync them up.
 ## Commands
 
 ```bash
-pip install -e ".[dev]"   # editable install, with ruff + pytest
+pip install -e '.[dev]'   # editable install + ruff + pytest
 dsync --help              # verify entry point resolves
-ruff check dsync/ tests/
-ruff format --check dsync/ tests/
-pytest                    # tests/test_ssh.py, tests/test_sync.py
+ruff check dsync/
+ruff format --check dsync/
+pytest
 ```
 
 ## CI
 
-`.github/workflows/ci.yml` runs two jobs, on every branch push and on PRs to
-master:
+`.github/workflows/ci.yml` runs two jobs:
 
-- **Lint** on Python 3.12 — `ruff check dsync/ tests/` and
-  `ruff format --check dsync/ tests/`. Format check is enforced, so run
-  `ruff format dsync/ tests/` before pushing. Tests are linted too.
-- **Test** across Python **3.9, 3.10, 3.11, 3.12** — `pip install -e ".[dev]"`,
-  then `dsync --help` and `pytest -q`.
-
-Both jobs install via `.[dev]`, so the **ruff version is pinned in
-`pyproject.toml`** and a new ruff release cannot turn the build red on its own.
-Bump it deliberately. The lint rule set is likewise explicit — see
-`[tool.ruff.lint]` — rather than inherited from ruff's shifting defaults.
+- **Lint** on Python 3.12 — `ruff check dsync/` and `ruff format --check dsync/`.
+  Format check is enforced, so run `ruff format dsync/` before pushing.
+- **Build & Test** across Python **3.9, 3.10, 3.11, 3.12** — `pip install -e .`,
+  `dsync --help`, then `pytest`.
 
 `requires-python = ">=3.9"`. Do not use 3.10+ syntax (`match`, `X | Y` in
 annotations at runtime, `tomllib`) — the 3.9 matrix leg will fail.
@@ -61,49 +54,19 @@ This tool writes to a live public website over SSH. Treat every change to
 - rsync `--delete` semantics are destructive on the remote. Never widen the
   delete scope or change exclude patterns without saying so explicitly.
 - Never log credentials, key material, or full SSH URIs with embedded auth.
-- The SSH key passphrase is never written to disk. It lives in the ssh-agent;
-  `Config` still reads a legacy `passphrase` key so old configs work, but
-  `to_dict` never emits it and `migrate_stored_passphrase` strips it on load.
-  Config files are written `0600` inside a `0700` directory via `os.open`.
-- Only ever kill or add to an ssh-agent that dsync itself started (`_own_agent_env`).
-  Keys dsync adds carry `-t AGENT_KEY_LIFETIME_SECONDS` so a missed teardown
-  still expires them.
-- Every `ssh-add` goes through `_ssh_add`, which uses a **one-shot** askpass
-  helper and a timeout. With `SSH_ASKPASS_REQUIRE=force` and a re-answerable
-  helper, a rejected passphrase sends ssh-add round its retry loop forever with
-  no tty to give up on — verified spinning at 100% CPU. Do not remove either guard.
-- Every local path from a user goes through `relative_to_root`, and every remote
-  path through `remote_path_for`. Both refuse to leave their configured root.
-  Never rebuild a remote path with `config.remote_root + rel_path` — `lstrip("/")`
-  does not strip `..`, which is how `push ../x` used to write outside the web root.
-- `Config.local_root` is `.resolve()`d. Path comparisons elsewhere come from
-  `Path.resolve()`, so leaving the root unresolved breaks `relative_to()` for
-  files that genuinely are in the project whenever the root contains a symlink.
 - Dry-run paths must stay genuinely side-effect-free. If you add a code path
   that writes, confirm it is gated behind the non-dry-run branch.
 
-## Testing
+- rsync failures raise `SyncError`; never turn a failed run into an empty
+  result, which callers read as "everything is in sync".
+- Host keys are verified against `~/.ssh/known_hosts` (`accept-new`) for both
+  rsync and paramiko. Do not reintroduce `StrictHostKeyChecking=no`.
+- `prune-backups` deletes only timestamp-named entries directly under
+  `backup_dir`; keep that filter if you touch it.
 
-`tests/test_ssh.py` covers connection and passphrase error handling, including
-degrading gracefully when ssh-agent is not installed.
-`tests/test_sync.py` covers the rsync layer at the argv level — it asserts that
-`--delete` never ships without `--dry-run`, that the transferring entry points
-(`rsync_pull`, `rsync_push_all`, `rsync_push_directory`) never pass `--delete`
-at all, and that src/dst ordering and excludes are wired correctly.
+## Tests
 
-Those argv assertions are the guard on the most dangerous code in the repo.
-If you change `_run_rsync` or any of its callers, expect them to fire — and
-treat a failure as a real finding, not a test to update. Add cases rather than
-relaxing them.
-
-`tests/test_cli.py` covers how failures are reported: a failed comparison must
-never print "everything is in sync", and the operation log must record what
-actually happened rather than inferring success from a file count.
-
-Every rsync result must go through `_check_rsync`, which raises `RsyncError`
-on a hard failure and tolerates the partial-transfer codes (23, 24). Never
-substitute empty output for a failed run — that is what made a broken `status`
-indistinguishable from a clean tree.
-
-Still uncovered: `config.py`, `state.py`, `log.py`, `watcher.py`, and the
-non-rsync half of `sync.py` (the SFTP and backup helpers).
+`tests/test_sync.py` covers `sync.py` with rsync and SSH stubbed out;
+`tests/test_ssh.py`, `tests/test_config.py` and `tests/test_misc.py` cover the
+rest. When touching `sync.py`, add tests rather than relying on manual
+verification against the live host.

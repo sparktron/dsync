@@ -19,34 +19,32 @@ dsync = "dsync.cli:cli"
 
 [project.optional-dependencies]
 dev = [
-    "ruff==0.16.3",
-    "pytest>=8.0",
+    "ruff==0.16.5",
+    "pytest>=7",
 ]
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["dsync*"]
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-
-# Ruff is pinned in [dev] and in CI. Leaving it unpinned means a new release
-# can turn the build red with no code change — which is how master sat broken
-# from 2026-03-28 onward. The rule set below is likewise explicit rather than
-# inherited from whatever the current default happens to be.
 [tool.ruff]
 target-version = "py39"
 
+# Ruff's *default* rule set is not stable across releases -- 0.16 widened it and
+# turned CI red on unchanged code. Select explicitly so a future ruff release
+# can only change this build when someone edits this block on purpose.
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "RUF"]
-ignore = [
-    "E501",     # line length is the formatter's job
-    "RUF001",   # the Rich status glyphs (ℹ, ✓, ✗, ⚠) are deliberate UI
-    "RUF002",
-    "RUF003",
-    "SIM105",   # try/except/pass is deliberate for best-effort teardown;
-                # converting to contextlib.suppress is a separate cleanup
+select = [
+    "E4", "E7", "E9",  # pycodestyle: the subset ruff has always defaulted to
+    "F",               # pyflakes
+    "I",               # import sorting
+    "UP",              # pyupgrade
+    "DTZ",             # timezone-naive datetimes
+    "PLW",             # pylint warnings
+    "RUF",             # ruff-specific
 ]
-
-[tool.ruff.lint.per-file-ignores]
-"tests/**" = ["SIM117"]  # nested `with patch(...)` reads better than one chain
+ignore = [
+    "UP045",   # Optional[X] -> X | None: cosmetic only; package still targets 3.9
+    "PLW0603", # module-level passphrase/agent cache is deliberate, not accidental
+    "RUF001",  # the "info" glyph in console output is intentional, not a typo
+]

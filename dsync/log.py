@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 LOG_FILE = Path.home() / ".dsync" / "sync.log"
@@ -20,7 +20,7 @@ def append_log(
     """Append one log entry (JSON line) to the sync log."""
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     entry: dict = {
-        "ts": datetime.now().isoformat(timespec="seconds"),
+        "ts": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
         "action": action,
         "files": files,
         "ok": ok,
@@ -39,8 +39,8 @@ def read_log(n: int = 50) -> list[dict]:
         return []
     entries = []
     with LOG_FILE.open() as f:
-        for line in f:
-            line = line.strip()
+        for raw in f:
+            line = raw.strip()
             if line:
                 try:
                     entries.append(json.loads(line))

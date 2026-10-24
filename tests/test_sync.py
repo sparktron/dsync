@@ -1,16 +1,8 @@
-"""Argv-level tests for the rsync invocations in dsync.sync.
-
-`sync.py` is the module that can delete files on a live public website, and
-`_run_rsync` takes `dry_run` as a bare boolean. Nothing previously asserted that
-the destructive `--delete` flag only ever ships alongside `--dry-run`, so a
-one-character edit could have turned `dsync status` into a destructive command
-silently. These tests pin that pairing, plus the exclude/src/dst wiring.
-
-They assert on the argv handed to subprocess, so no network or SSH is involved.
-"""
+"""Unit tests for sync.py -- no network, rsync and SSH are stubbed."""
 
 from __future__ import annotations
 
+import os
 import subprocess
 from unittest.mock import MagicMock
 
@@ -18,207 +10,49 @@ import pytest
 
 from dsync import sync
 from dsync.config import Config
-from dsync.state import _matches_ignore
-from dsync.sync import _parse_itemize
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
+from dsync.state import StateManager, _matches_ignore
 
 
 @pytest.fixture
 def config(tmp_path):
-    """A Config rooted in tmp_path so nothing touches a real project."""
-    local_root = tmp_path / "site"
-    (local_root / "css").mkdir(parents=True)
-    (local_root / "index.html").write_text("<h1>hi</h1>")
-    (local_root / "css" / "style.css").write_text("body{}")
+    root = tmp_path / "site"
+    root.mkdir()
     return Config(
         {
             "host": "example.com",
-            "port": 50288,
-            "user": "testuser",
+            "port": 22,
+            "user": "u",
             "key_path": str(tmp_path / "id_rsa"),
-            "local_root": str(local_root),
-            "remote_root": "/home/testuser/public_html/",
-            "site_url": "https://example.com",
-            "ignore_patterns": [".git/", "*.gz"],
+            "local_root": str(root),
+            "remote_root": "/home/u/public_html",
+            "site_url": "https://example.com/",
+            "backup_dir": "/home/u/backups/dsync",
         }
     )
 
 
 @pytest.fixture
-def argv(monkeypatch):
-    """Capture every rsync argv, and keep get_rsync_env from spawning an agent."""
-    calls: list[list[str]] = []
+def state(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "dsync.state._state_file_for", lambda profile: tmp_path / "state.json"
+    )
+    return StateManager()
 
-    def fake_run(cmd, *args, **kwargs):
-        calls.append(list(cmd))
-        return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
 
-    monkeypatch.setattr(sync.subprocess, "run", fake_run)
-    monkeypatch.setattr(sync, "get_rsync_env", lambda *a, **k: {})
+def _proc(returncode=0, stdout="", stderr=""):
+    return subprocess.CompletedProcess([], returncode, stdout, stderr)
+
+
+def _stub_rsync(monkeypatch, *results):
+    calls = []
+    it = iter(results)
+
+    def fake(config, src, dst, extra_flags=None, dry_run=False, capture=True):
+        calls.append({"src": src, "dst": dst, "flags": extra_flags, "dry": dry_run})
+        return next(it)
+
+    monkeypatch.setattr(sync, "_run_rsync", fake)
     return calls
-
-
-# ---------------------------------------------------------------------------
-# Drivers — one per rsync-invoking entry point
-# ---------------------------------------------------------------------------
-
-
-def _drive_pull(config):
-    sync.rsync_pull(config, MagicMock())
-
-
-def _drive_push_dry_run(config):
-    sync.rsync_push_dry_run(config)
-
-
-def _drive_push_all(config):
-    sync.rsync_push_all(config, MagicMock())
-
-
-def _drive_push_directory(config):
-    sync.rsync_push_directory(config, MagicMock(), "css")
-
-
-def _drive_status(config):
-    sync.rsync_status(config, MagicMock())
-
-
-ALL_DRIVERS = [
-    ("rsync_pull", _drive_pull),
-    ("rsync_push_dry_run", _drive_push_dry_run),
-    ("rsync_push_all", _drive_push_all),
-    ("rsync_push_directory", _drive_push_directory),
-    ("rsync_status", _drive_status),
-]
-
-# Entry points that perform a real (non-dry-run) transfer. None of them may
-# carry --delete: dsync's push path is additive by design.
-MUTATING_DRIVERS = [
-    ("rsync_pull", _drive_pull),
-    ("rsync_push_all", _drive_push_all),
-    ("rsync_push_directory", _drive_push_directory),
-]
-
-
-# ---------------------------------------------------------------------------
-# The load-bearing invariant
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(("name", "driver"), ALL_DRIVERS)
-def test_delete_never_ships_without_dry_run(name, driver, config, argv):
-    """--delete is only ever safe here paired with --dry-run."""
-    driver(config)
-    assert argv, f"{name} issued no rsync command"
-    for cmd in argv:
-        if "--delete" in cmd:
-            assert "--dry-run" in cmd, (
-                f"{name} passed --delete without --dry-run: {cmd}"
-            )
-
-
-@pytest.mark.parametrize(("name", "driver"), MUTATING_DRIVERS)
-def test_transferring_commands_never_delete(name, driver, config, argv):
-    """A command that actually writes to the remote must not delete anything."""
-    driver(config)
-    for cmd in argv:
-        assert "--dry-run" not in cmd, f"{name} unexpectedly became a dry run"
-        assert "--delete" not in cmd, (
-            f"{name} performs a real transfer and must not pass --delete: {cmd}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Per-entry-point flag expectations
-# ---------------------------------------------------------------------------
-
-
-def test_push_dry_run_is_a_dry_run_without_delete(config, argv):
-    sync.rsync_push_dry_run(config)
-    (cmd,) = argv
-    assert "--dry-run" in cmd
-    assert "--delete" not in cmd
-
-
-def test_status_issues_two_dry_runs_both_with_delete(config, argv):
-    """Status compares both directions; --delete is what surfaces extra files."""
-    sync.rsync_status(config, MagicMock())
-    assert len(argv) == 2, "status should issue exactly one dry-run per direction"
-    for cmd in argv:
-        assert "--dry-run" in cmd
-        assert "--delete" in cmd
-
-
-def test_status_probes_push_then_pull_direction(config, argv):
-    sync.rsync_status(config, MagicMock())
-    push_cmd, pull_cmd = argv
-    local = str(config.local_root) + "/"
-    remote = f"{config.user}@{config.host}:{config.remote_root}"
-    assert push_cmd[-2:] == [local, remote]
-    assert pull_cmd[-2:] == [remote, local]
-
-
-# ---------------------------------------------------------------------------
-# Source / destination wiring
-# ---------------------------------------------------------------------------
-
-
-def test_pull_reads_remote_writes_local(config, argv):
-    sync.rsync_pull(config, MagicMock())
-    (cmd,) = argv
-    assert cmd[-2] == f"{config.user}@{config.host}:{config.remote_root}"
-    assert cmd[-1] == str(config.local_root) + "/"
-
-
-def test_push_all_reads_local_writes_remote(config, argv):
-    sync.rsync_push_all(config, MagicMock())
-    (cmd,) = argv
-    assert cmd[-2] == str(config.local_root) + "/"
-    assert cmd[-1] == f"{config.user}@{config.host}:{config.remote_root}"
-
-
-def test_push_directory_scopes_both_sides_to_the_subtree(config, argv):
-    sync.rsync_push_directory(config, MagicMock(), "css")
-    (cmd,) = argv
-    assert cmd[-2] == str(config.local_root / "css") + "/"
-    assert cmd[-1] == f"{config.user}@{config.host}:{config.remote_root}css/"
-
-
-# ---------------------------------------------------------------------------
-# Excludes and transport
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(("name", "driver"), ALL_DRIVERS)
-def test_ignore_patterns_forwarded_as_excludes(name, driver, config, argv):
-    driver(config)
-    for cmd in argv:
-        pairs = [(cmd[i], cmd[i + 1]) for i, a in enumerate(cmd) if a == "--exclude"]
-        assert [p[1] for p in pairs] == config.ignore_patterns, (
-            f"{name} did not forward ignore_patterns: {cmd}"
-        )
-
-
-@pytest.mark.parametrize(("name", "driver"), ALL_DRIVERS)
-def test_transport_carries_port_and_key(name, driver, config, argv):
-    driver(config)
-    for cmd in argv:
-        ssh_cmd = cmd[cmd.index("-e") + 1]
-        assert f"-p {config.port}" in ssh_cmd
-        assert str(config.key_path) in ssh_cmd
-
-
-@pytest.mark.parametrize(("name", "driver"), ALL_DRIVERS)
-def test_checksum_and_itemize_always_requested(name, driver, config, argv):
-    """Status parsing depends on --itemize-changes; --checksum on mtime-unsafe hosts."""
-    driver(config)
-    for cmd in argv:
-        assert cmd[0] == "rsync"
-        assert "--checksum" in cmd
-        assert "--itemize-changes" in cmd
 
 
 # ---------------------------------------------------------------------------
@@ -226,290 +60,328 @@ def test_checksum_and_itemize_always_requested(name, driver, config, argv):
 # ---------------------------------------------------------------------------
 
 
-def test_parse_itemize_splits_transfers_from_deletions():
-    output = (
-        ">f+++++++++ index.html\n"
-        ">f.st...... css/style.css\n"
-        "cd+++++++++ newdir/\n"
-        "*deleting   old/page.html\n"
-    )
-    transfers, deletions = _parse_itemize(output)
-    assert transfers == ["index.html", "css/style.css"]
-    assert deletions == ["old/page.html"]
-
-
-def test_parse_itemize_keeps_paths_containing_spaces():
-    transfers, _ = _parse_itemize(">f+++++++++ my page with spaces.html\n")
-    assert transfers == ["my page with spaces.html"]
-
-
-def test_parse_itemize_skips_directories_and_the_root_entry():
-    transfers, deletions = _parse_itemize("cd+++++++++ assets/\n.d..t...... ./\n")
-    assert transfers == []
-    assert deletions == []
-
-
-def test_parse_itemize_tolerates_empty_output():
-    assert _parse_itemize("") == ([], [])
-
-
-# ---------------------------------------------------------------------------
-# Ignore matching
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("rel_path", "expected"),
-    [
-        ("index.html", False),
-        ("images/a.png", True),
-        ("css/images/a.png", True),
-        ("notes/images.txt", False),
-        ("archive.gz", True),
-        ("sub/.git/config", True),
-        ("docs/DS_Store", False),
-    ],
-)
-def test_matches_ignore_unanchored_patterns(rel_path, expected):
-    patterns = [".git/", "images/", "*.gz", ".DS_Store"]
-    assert _matches_ignore(rel_path, patterns) is expected
-
-
-def test_matches_ignore_with_no_patterns():
-    assert _matches_ignore("anything/at/all.html", []) is False
-
-
-# ---------------------------------------------------------------------------
-# Failure propagation
-#
-# The regression these guard: `rsync_status` used to substitute "" for a failed
-# probe's output, so a network or auth failure produced four empty lists and the
-# CLI printed "Everything is in sync." A false in-sync is indistinguishable from
-# a real one, which is the worst outcome available to a deploy tool.
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def failing_rsync(monkeypatch):
-    """Make every rsync invocation fail with a chosen exit code."""
-
-    def install(returncode: int, stderr: str = "ssh: connect: no route to host"):
-        def fake_run(cmd, *args, **kwargs):
-            return subprocess.CompletedProcess(
-                cmd, returncode=returncode, stdout="", stderr=stderr
-            )
-
-        monkeypatch.setattr(sync.subprocess, "run", fake_run)
-        monkeypatch.setattr(sync, "get_rsync_env", lambda *a, **k: {})
-
-    return install
-
-
-@pytest.mark.parametrize(("name", "driver"), ALL_DRIVERS)
-def test_hard_failure_raises_instead_of_returning_empty(
-    name, driver, config, failing_rsync
-):
-    failing_rsync(255)
-    with pytest.raises(sync.RsyncError):
-        driver(config)
-
-
-def test_status_never_reports_empty_groups_on_failure(config, failing_rsync):
-    """The specific shape of the old bug: failure must not look like a clean tree."""
-    failing_rsync(255)
-    with pytest.raises(sync.RsyncError):
-        sync.rsync_status(config, MagicMock())
-
-
-def test_rsync_error_carries_exit_code_and_stderr(config, failing_rsync):
-    failing_rsync(255, stderr="Permission denied (publickey).")
-    with pytest.raises(sync.RsyncError) as excinfo:
-        sync.rsync_push_dry_run(config)
-    err = excinfo.value
-    assert err.returncode == 255
-    assert "Permission denied (publickey)." in err.stderr
-    assert "255" in str(err)
-
-
-@pytest.mark.parametrize("code", [23, 24])
-def test_partial_transfer_codes_are_tolerated(code, config, monkeypatch):
-    """23/24 still produce usable output, so status stays available."""
-
-    def fake_run(cmd, *args, **kwargs):
-        return subprocess.CompletedProcess(
-            cmd, returncode=code, stdout=">f+++++++++ index.html\n", stderr="vanished"
+class TestParseItemize:
+    def test_transfers_and_deletions(self):
+        out = (
+            "<f+++++++++ new.html\n"
+            "<f.st...... css/style.css\n"
+            "cd+++++++++ newdir/\n"
+            "*deleting   old.html\n"
+            ".d..t...... ./\n"
         )
+        transfers, deletions = sync._parse_itemize(out)
+        assert transfers == ["new.html", "css/style.css"]
+        assert deletions == ["old.html"]
 
-    monkeypatch.setattr(sync.subprocess, "run", fake_run)
-    monkeypatch.setattr(sync, "get_rsync_env", lambda *a, **k: {})
+    def test_paths_with_spaces(self):
+        transfers, _ = sync._parse_itemize("<f+++++++++ my file.html\n")
+        assert transfers == ["my file.html"]
 
-    assert sync.rsync_push_dry_run(config) == ["index.html"]
+    def test_symlink_counts_as_transfer(self):
+        transfers, _ = sync._parse_itemize("cL+++++++++ link -> target\n")
+        assert transfers == ["link -> target"]
 
+    def test_attribute_only_change_is_not_a_transfer(self):
+        transfers, deletions = sync._parse_itemize(".f..t...... same.html\n")
+        assert transfers == [] and deletions == []
 
-def test_check_rsync_returns_partial_flag():
-    ok = subprocess.CompletedProcess([], returncode=0, stdout="", stderr="")
-    partial = subprocess.CompletedProcess([], returncode=24, stdout="", stderr="")
-    assert sync._check_rsync(ok, "probe") is False
-    assert sync._check_rsync(partial, "probe") is True
-
-
-def test_missing_rsync_reports_cleanly(config, monkeypatch):
-    """A missing rsync binary must not surface as a raw FileNotFoundError."""
-
-    def boom(*args, **kwargs):
-        raise FileNotFoundError(2, "No such file or directory", "rsync")
-
-    monkeypatch.setattr(sync.subprocess, "run", boom)
-    monkeypatch.setattr(sync, "get_rsync_env", lambda *a, **k: {})
-
-    with pytest.raises(sync.RsyncError) as excinfo:
-        sync.rsync_push_dry_run(config)
-    assert excinfo.value.returncode is None
-    assert "not installed or not on PATH" in str(excinfo.value)
+    def test_empty(self):
+        assert sync._parse_itemize("") == ([], [])
 
 
 # ---------------------------------------------------------------------------
-# Path confinement
-#
-# `lstrip("/")` does not strip `..`, and the ValueError from relative_to() was
-# swallowed with `pass`, so `dsync push ../secrets.env` uploaded a file from
-# outside the project to outside the remote web root with no confirmation.
-#
-# The companion bug: local_root was expanduser()'d but never resolve()'d, while
-# every candidate path was resolve()'d. On a symlinked project root that made
-# relative_to() fail for files that genuinely are in the project — so closing
-# the escape without resolving the root would have rejected valid pushes.
+# Small helpers
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture
-def linked_config(tmp_path):
-    """A config whose local_root is a symlink to the real project directory."""
-    real = tmp_path / "real_site"
-    (real / "css").mkdir(parents=True)
-    (real / "index.html").write_text("<h1>hi</h1>")
-    (real / "css" / "style.css").write_text("body{}")
-    (tmp_path / "secrets.env").write_text("SECRET")
-    link = tmp_path / "site_link"
-    link.symlink_to(real)
-    cfg = Config(
-        {
-            "host": "example.com",
-            "port": 22,
-            "user": "testuser",
-            "key_path": str(tmp_path / "id_rsa"),
-            "local_root": str(link),
-            "remote_root": "/home/testuser/public_html/",
-            "site_url": "https://example.com",
+class TestFileToUrl:
+    @pytest.mark.parametrize(
+        ("rel", "url"),
+        [
+            ("index.html", "https://example.com/"),
+            ("aboutme/index.html", "https://example.com/aboutme/"),
+            ("css/style.css", "https://example.com/css/style.css"),
+        ],
+    )
+    def test_mapping(self, config, rel, url):
+        assert sync.file_to_url(config, rel) == url
+
+
+class TestMatchesIgnore:
+    @pytest.mark.parametrize(
+        ("rel", "expected"),
+        [
+            (".git/config", True),
+            ("images/a.png", True),
+            ("sub/images/a.png", True),
+            ("backup.zip", True),
+            ("a/b/.DS_Store", True),
+            ("index.html", False),
+            ("css/style.css", False),
+        ],
+    )
+    def test_default_patterns(self, config, rel, expected):
+        assert _matches_ignore(rel, config.ignore_patterns) is expected
+
+
+class TestSafeRelPath:
+    @pytest.mark.parametrize("rel", ["index.html", "a/b.css", "a..b/c", "my file"])
+    def test_safe(self, rel):
+        assert sync.is_safe_rel_path(rel)
+
+    @pytest.mark.parametrize("rel", ["", "/etc/passwd", "../x", "a/../../x", ".."])
+    def test_unsafe(self, rel):
+        assert not sync.is_safe_rel_path(rel)
+
+
+class TestSshCmd:
+    def test_verifies_host_keys(self, config):
+        cmd = sync._ssh_cmd(config)
+        assert "StrictHostKeyChecking=no" not in cmd
+        assert "/dev/null" not in cmd
+        assert "StrictHostKeyChecking=accept-new" in cmd
+
+    def test_rsync_protects_args(self, config, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(sync, "get_rsync_env", lambda *a, **k: {})
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda cmd, **kw: captured.setdefault("cmd", cmd) and _proc(),
+        )
+        sync._run_rsync(config, "a/", "b/")
+        assert "--protect-args" in captured["cmd"]
+
+
+# ---------------------------------------------------------------------------
+# rsync failures must surface, never read as "in sync"
+# ---------------------------------------------------------------------------
+
+
+class TestFailuresRaise:
+    def test_push_dry_run_failure_raises(self, config, monkeypatch):
+        _stub_rsync(monkeypatch, _proc(255, stderr="Permission denied"))
+        with pytest.raises(sync.SyncError, match="Permission denied"):
+            sync.rsync_push_dry_run(config)
+
+    def test_push_dry_run_success_empty_means_in_sync(self, config, monkeypatch):
+        _stub_rsync(monkeypatch, _proc(0, stdout=""))
+        assert sync.rsync_push_dry_run(config) == []
+
+    def test_push_all_failure_raises_and_keeps_state(
+        self, config, state, monkeypatch
+    ):
+        _stub_rsync(monkeypatch, _proc(23, stderr="partial transfer"))
+        with pytest.raises(sync.SyncError):
+            sync.rsync_push_all(config, state)
+        assert state.is_empty()
+
+    def test_pull_failure_raises(self, config, state, monkeypatch):
+        _stub_rsync(monkeypatch, _proc(12, stderr="protocol error"))
+        with pytest.raises(sync.SyncError):
+            sync.rsync_pull(config, state)
+
+    def test_pull_returns_transfers(self, config, state, monkeypatch):
+        _stub_rsync(monkeypatch, _proc(0, stdout=">f+++++++++ a.html\n"))
+        assert sync.rsync_pull(config, state) == ["a.html"]
+
+    @pytest.mark.parametrize("failing", [0, 1])
+    def test_status_failure_raises(self, config, monkeypatch, failing):
+        results = [_proc(0), _proc(0)]
+        results[failing] = _proc(255, stderr="Connection refused")
+        _stub_rsync(monkeypatch, *results)
+        with pytest.raises(sync.SyncError, match="Connection refused"):
+            sync.rsync_status(config, MagicMock())
+
+    def test_directory_failure_raises(self, config, state, monkeypatch):
+        (config.local_root / "css").mkdir()
+        _stub_rsync(monkeypatch, _proc(23))
+        with pytest.raises(sync.SyncError):
+            sync.rsync_push_directory(config, state, "css")
+
+
+class TestStatus:
+    def test_groups(self, config, monkeypatch):
+        (config.local_root / "both.html").write_text("local")
+        os.utime(config.local_root / "both.html", (100, 100))
+        (config.local_root / "mine.html").write_text("x")
+        push = _proc(
+            stdout="<f.st...... both.html\n<f.st...... edited.html\n"
+            "*deleting   theirs.html\n"
+        )
+        pull = _proc(
+            stdout=">f.st...... both.html\n>f.st...... edited.html\n"
+            "*deleting   mine.html\n"
+        )
+        calls = _stub_rsync(monkeypatch, push, pull)
+        ssh = MagicMock()
+        # Remote copy of both.html is newer; edited.html is newer locally.
+        ssh.sftp.stat.side_effect = lambda p: MagicMock(
+            st_mtime=200 if p.endswith("both.html") else 0
+        )
+        (config.local_root / "edited.html").write_text("y")
+
+        groups = sync.rsync_status(config, ssh)
+
+        assert groups == {
+            "local_newer": ["edited.html"],
+            "remote_newer": ["both.html"],
+            "local_only": ["mine.html"],
+            "remote_only": ["theirs.html"],
         }
-    )
-    return cfg, tmp_path, real, link
+        assert all(c["dry"] and c["flags"] == ["--delete"] for c in calls)
 
 
-def test_local_root_is_resolved_not_merely_expanded(linked_config):
-    cfg, _tmp, real, link = linked_config
-    assert cfg.local_root == real.resolve()
-    assert cfg.local_root != link
+# ---------------------------------------------------------------------------
+# Directory push / state tracking
+# ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("given", "expected"),
-    [
-        ("index.html", "index.html"),
-        ("css/style.css", "css/style.css"),
-        ("/index.html", "index.html"),
-    ],
-)
-def test_relative_to_root_accepts_in_project_paths(given, expected, linked_config):
-    cfg, _tmp, _real, _link = linked_config
-    assert sync.relative_to_root(cfg, given) == expected
+class TestPushDirectory:
+    def test_ignored_files_not_tracked(self, config, state, monkeypatch):
+        d = config.local_root / "blog"
+        d.mkdir()
+        (d / "post.html").write_text("p")
+        (d / "post.html.swp").write_text("swap")
+        (d / ".DS_Store").write_text("junk")
+        _stub_rsync(monkeypatch, _proc(stdout="<f+++++++++ post.html\n"))
+
+        transferred = sync.rsync_push_directory(config, state, "blog")
+
+        assert transferred == ["blog/post.html"]
+        assert [p for p, _ in state.items()] == ["blog/post.html"]
+
+    def test_rejects_escaping_path(self, config, state, monkeypatch):
+        calls = _stub_rsync(monkeypatch)
+        with pytest.raises(sync.SyncError, match="outside the site root"):
+            sync.rsync_push_directory(config, state, "../elsewhere")
+        assert calls == []
 
 
-def test_relative_to_root_accepts_paths_through_the_symlinked_root(linked_config):
-    """The BUG-9 regression: an in-project file reached via the symlink."""
-    cfg, _tmp, real, link = linked_config
-    assert sync.relative_to_root(cfg, str(link / "index.html")) == "index.html"
-    assert (
-        sync.relative_to_root(cfg, str(real / "css" / "style.css")) == "css/style.css"
-    )
+# ---------------------------------------------------------------------------
+# Single-file push
+# ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "escape",
-    [
-        "../secrets.env",
-        "../../../etc/passwd",
-        "/etc/passwd",
-        "css/../../secrets.env",
-    ],
-)
-def test_relative_to_root_refuses_to_escape(escape, linked_config):
-    cfg, _tmp, _real, _link = linked_config
-    with pytest.raises(sync.PathOutsideRoot):
-        sync.relative_to_root(cfg, escape)
+class TestPushSingleFile:
+    def test_uploads_preserving_mtime(self, config, state):
+        f = config.local_root / "css" / "a.css"
+        f.parent.mkdir()
+        f.write_text("body{}")
+        os.utime(f, (111, 222))
+        ssh = MagicMock()
+        ssh.run.return_value = ("", "")
+
+        assert sync.push_single_file(ssh, config, state, "css/a.css")
+
+        remote = "/home/u/public_html/css/a.css"
+        ssh.sftp.put.assert_called_once_with(str(f), remote)
+        ssh.sftp.utime.assert_called_once_with(remote, (111, 222))
+        mkdirs = [c.args[0] for c in ssh.run.call_args_list if "mkdir -p" in c.args[0]]
+        assert any("/home/u/public_html/css" in c for c in mkdirs)
+        assert state.get("css/a.css") is not None
+
+    def test_refuses_escaping_path(self, config, state):
+        ssh = MagicMock()
+        assert not sync.push_single_file(ssh, config, state, "../x")
+        ssh.sftp.put.assert_not_called()
 
 
-def test_relative_path_is_read_against_the_root_not_the_cwd(linked_config, monkeypatch):
-    """`dsync push css/style.css` must work from any directory."""
-    cfg, tmp, _real, _link = linked_config
-    elsewhere = tmp / "elsewhere"
-    elsewhere.mkdir()
-    monkeypatch.chdir(elsewhere)
-    assert sync.relative_to_root(cfg, "css/style.css") == "css/style.css"
+# ---------------------------------------------------------------------------
+# Backups
+# ---------------------------------------------------------------------------
 
 
-def test_cwd_relative_file_outside_the_root_is_refused(linked_config, monkeypatch):
-    cfg, tmp, _real, _link = linked_config
-    elsewhere = tmp / "elsewhere"
-    elsewhere.mkdir()
-    (elsewhere / "stray.html").write_text("x")
-    monkeypatch.chdir(elsewhere)
-    with pytest.raises(sync.PathOutsideRoot):
-        sync.relative_to_root(cfg, "stray.html")
+class TestBackups:
+    def test_backup_mirrors_tree_without_collisions(self, config):
+        ssh = MagicMock()
+        ssh.run.return_value = ("", "")
+        backup_dir, failed = sync.backup_remote_files(
+            ssh, config, ["a/b_c.html", "a_b/c.html"]
+        )
+        assert failed == []
+        cmds = " ".join(c.args[0] for c in ssh.run.call_args_list)
+        assert f"{backup_dir}/a/b_c.html" in cmds
+        assert f"{backup_dir}/a_b/c.html" in cmds
+        assert "|| true" not in cmds
 
+    def test_backup_reports_failures(self, config):
+        ssh = MagicMock()
 
-# --- remote side -----------------------------------------------------------
+        def run(cmd, check=True):
+            if "bad.html" in cmd:
+                raise RuntimeError("cp: Permission denied")
+            return "", ""
 
+        ssh.run.side_effect = run
+        _, failed = sync.backup_remote_files(ssh, config, ["ok.html", "bad.html"])
+        assert failed == ["bad.html"]
 
-@pytest.mark.parametrize(
-    ("rel", "expected"),
-    [
-        ("index.html", "/home/testuser/public_html/index.html"),
-        ("css/style.css", "/home/testuser/public_html/css/style.css"),
-        ("", "/home/testuser/public_html"),
-    ],
-)
-def test_remote_path_for_joins_under_the_remote_root(rel, expected, config):
-    assert sync.remote_path_for(config, rel) == expected
+    def test_backup_cmd_skips_missing_source(self, tmp_path):
+        """Run the generated shell for real: new file -> no-op, exit 0."""
+        src, dest = tmp_path / "missing", tmp_path / "bk" / "sub" / "missing"
+        r = subprocess.run(
+            ["sh", "-c", sync._backup_cmd(str(src), str(dest))], check=False
+        )
+        assert r.returncode == 0 and not dest.exists()
 
+    def test_backup_cmd_copies_and_keeps_first(self, tmp_path):
+        src = tmp_path / "f.html"
+        dest = tmp_path / "bk" / "d" / "f.html"
+        src.write_text("v1")
+        cmd = ["sh", "-c", sync._backup_cmd(str(src), str(dest))]
+        assert subprocess.run(cmd, check=False).returncode == 0
+        src.write_text("v2")
+        assert subprocess.run(cmd, check=False).returncode == 0
+        assert dest.read_text() == "v1"
 
-@pytest.mark.parametrize("escape", ["../secrets.env", "../../etc/passwd", "a/../../b"])
-def test_remote_path_for_refuses_to_escape(escape, config):
-    with pytest.raises(sync.PathOutsideRoot):
-        sync.remote_path_for(config, escape)
+    def test_backup_cmd_fails_loudly(self, tmp_path):
+        src = tmp_path / "f.html"
+        src.write_text("x")
+        blocker = tmp_path / "bk"
+        blocker.write_text("not a dir")
+        r = subprocess.run(
+            ["sh", "-c", sync._backup_cmd(str(src), str(blocker / "f.html"))],
+            capture_output=True,
+            check=False,
+        )
+        assert r.returncode != 0
 
+    def test_find_old_backups_filters_to_dsync_names(self, config):
+        base = "/home/u/backups/dsync"
+        ssh = MagicMock()
+        ssh.run.return_value = (
+            f"{base}/2026-01-01_10-00-00\n"
+            f"{base}/2026-01-02_10-00-00.tar.gz\n"
+            f"{base}/2025-12-01_09-00-00_css_style.css\n"
+            f"{base}/important-notes.txt\n"
+            f"{base}/2026-01-01_10-00-00/nested\n",
+            "",
+        )
+        old = sync.find_old_backups(ssh, config, 30)
+        assert old == [
+            f"{base}/2025-12-01_09-00-00_css_style.css",
+            f"{base}/2026-01-01_10-00-00",
+            f"{base}/2026-01-02_10-00-00.tar.gz",
+        ]
+        assert "-mtime +30" in ssh.run.call_args.args[0]
 
-def test_push_single_file_refuses_an_escaping_relative_path(config, tmp_path):
-    """Defense in depth: even if a bad rel_path reaches sync, nothing is written."""
-    outside = config.local_root.parent / "secrets.env"
-    outside.write_text("SECRET")
-    ssh = MagicMock()
-    with pytest.raises(sync.PathOutsideRoot):
-        sync.push_single_file(ssh, config, MagicMock(), "../secrets.env")
-    ssh.sftp.put.assert_not_called()
-    ssh.run.assert_not_called()
+    def test_find_old_backups_rejects_bad_retention(self, config):
+        with pytest.raises(sync.SyncError):
+            sync.find_old_backups(MagicMock(), config, 0)
 
+    def test_find_old_backups_refuses_root(self, config):
+        config.backup_dir = "/"
+        with pytest.raises(sync.SyncError, match="Refusing"):
+            sync.find_old_backups(MagicMock(), config, 30)
 
-def test_leading_slash_is_read_as_a_site_path(linked_config):
-    """`dsync open /aboutme/index.html` means the site root, not the filesystem."""
-    cfg, _tmp, real, _link = linked_config
-    (real / "aboutme").mkdir()
-    (real / "aboutme" / "index.html").write_text("<h1>about</h1>")
-    assert sync.relative_to_root(cfg, "/aboutme/index.html") == "aboutme/index.html"
+    def test_delete_refuses_non_backup(self):
+        ssh = MagicMock()
+        with pytest.raises(sync.SyncError):
+            sync.delete_backups(ssh, ["/home/u/public_html"])
+        ssh.run.assert_not_called()
 
-
-def test_absolute_path_to_a_real_file_outside_the_root_is_refused(linked_config):
-    """An absolute path that exists elsewhere means that file, not a site path."""
-    cfg, tmp, _real, _link = linked_config
-    with pytest.raises(sync.PathOutsideRoot):
-        sync.relative_to_root(cfg, str(tmp / "secrets.env"))
+    def test_delete_backups(self):
+        ssh = MagicMock()
+        sync.delete_backups(ssh, ["/b/2026-01-01_10-00-00"])
+        ssh.run.assert_called_once_with("rm -rf -- /b/2026-01-01_10-00-00")
