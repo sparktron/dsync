@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import click
+import paramiko
 from rich.console import Console
 from rich.syntax import Syntax
 from rich.table import Table
@@ -47,14 +48,21 @@ def _to_rel_path(config, path: str) -> str:
     to the cwd) that resolves to somewhere under local_root.
     """
     root = config.local_root.resolve()
-    abs_path = Path(path).expanduser().resolve()
-    if abs_path.exists():
-        try:
-            rel = abs_path.relative_to(root).as_posix()
-            return "" if rel == "." else rel
-        except ValueError:
-            pass  # not under local_root; fall back to treating it as relative
-    return path.lstrip("/")
+    candidate = Path(path).expanduser()
+    if candidate.is_absolute():
+        resolved = candidate.resolve()
+        if not resolved.exists() and not resolved.is_relative_to(root):
+            resolved = (root / path.lstrip("/")).resolve()
+    else:
+        resolved = (root / candidate).resolve()
+        cwd_path = candidate.resolve()
+        if not resolved.exists() and cwd_path.exists():
+            resolved = cwd_path
+    try:
+        rel = resolved.relative_to(root).as_posix()
+    except ValueError:
+        raise SyncError(f"Path is outside the site root: {path}") from None
+    return "" if rel == "." else rel
 
 
 @click.group()
@@ -96,7 +104,7 @@ def pull(ctx: click.Context) -> None:
     try:
         with SSHManager(config, profile=profile) as ssh:  # noqa: F841  (establishes connection + verifies auth)
             pulled = rsync_pull(config, state)
-    except SyncError as exc:
+    except (SyncError, paramiko.SSHException, OSError) as exc:
         _log_failure("pull", [], t0, profile)
         raise click.ClickException(str(exc)) from exc
     append_log(
@@ -147,6 +155,8 @@ def push(ctx: click.Context, path: str | None, show_diff: bool) -> None:
 
     t0 = time.monotonic()
     try:
+        if path:
+            _to_rel_path(config, path)
         with SSHManager(config, profile=profile) as ssh:
             if path:
                 transferred = _push_path(ssh, config, state, path)
@@ -154,7 +164,7 @@ def push(ctx: click.Context, path: str | None, show_diff: bool) -> None:
                 transferred = _push_all_interactive(
                     ssh, config, state, show_diff=show_diff
                 )
-    except SyncError as exc:
+    except (SyncError, paramiko.SSHException, OSError) as exc:
         _log_failure("push", [path] if path else [], t0, profile)
         raise click.ClickException(str(exc)) from exc
 
@@ -422,7 +432,7 @@ def status(ctx: click.Context, local_only: bool) -> None:
     try:
         with SSHManager(config, profile=profile) as ssh:
             groups = rsync_status(config, ssh)
-    except SyncError as exc:
+    except (SyncError, paramiko.SSHException, OSError) as exc:
         raise click.ClickException(str(exc)) from exc
 
     total = sum(len(v) for v in groups.values())
@@ -517,7 +527,7 @@ def backup(ctx: click.Context) -> None:
         with SSHManager(config, profile=profile) as ssh:
             backup_path = create_full_backup(ssh, config)
             console.print(f"[green]✓[/] Backup created: {backup_path}")
-    except RuntimeError as exc:
+    except (RuntimeError, paramiko.SSHException, OSError) as exc:
         _log_failure("backup", [], t0, profile)
         raise click.ClickException(str(exc)) from exc
     append_log(
@@ -567,7 +577,7 @@ def prune_backups(ctx: click.Context, days: int | None, yes: bool) -> None:
             ):
                 return
             delete_backups(ssh, old)
-    except RuntimeError as exc:
+    except (RuntimeError, paramiko.SSHException, OSError) as exc:
         _log_failure("prune", [], t0, profile)
         raise click.ClickException(str(exc)) from exc
     console.print(f"[green]✓[/] Deleted {len(old)} backup(s).")
@@ -594,7 +604,10 @@ def open_url(ctx: click.Context, path: str | None) -> None:
     config = load_config(profile=profile)
 
     if path:
-        url = file_to_url(config, _to_rel_path(config, path))
+        try:
+            url = file_to_url(config, _to_rel_path(config, path))
+        except SyncError as exc:
+            raise click.ClickException(str(exc)) from exc
     else:
         url = config.site_url
 
